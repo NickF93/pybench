@@ -98,10 +98,14 @@ def benchmark_op(name, fn, device, iterations, logger):
     help="Random seed.",
 )
 @click.option(
+    "--device", default=None, show_default=True,
+    help="Specify the device to test"
+)
+@click.option(
     "--verbose", is_flag=True,
     help="Enable DEBUG logging.",
 )
-def main(iterations: int, size: int, dtype: str, seed: int, verbose: bool):
+def main(iterations: int, size: int, dtype: str, seed: int, device: str, verbose: bool):
     """
     Benchmark common PyTorch operations across available devices.
     """
@@ -118,6 +122,8 @@ def main(iterations: int, size: int, dtype: str, seed: int, verbose: bool):
 
     torch.manual_seed(seed)
     devices = get_devices()
+    if device is not None:
+        devices = [dev for dev in devices if dev.type.startswith(device)]
     logger.info(f"Detected devices: {devices}")
 
     # Map dtype strings to torch dtypes

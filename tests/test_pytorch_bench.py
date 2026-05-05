@@ -164,7 +164,12 @@ def make_fake_torch():
     fake_torch.relu = mock.Mock(return_value=FakeTensor("relu"))
 
     def empty(shape, device=None, dtype=None):
-        elements = shape[0] if isinstance(shape, tuple) else shape
+        if shape == ():
+            elements = 1
+        elif isinstance(shape, tuple):
+            elements = shape[0]
+        else:
+            elements = shape
         if dtype == fake_torch.float16:
             element_size = 2
         elif dtype == fake_torch.float64:
@@ -192,6 +197,12 @@ def load_bench_module(fake_torch=None):
     with mock.patch.dict(sys.modules, {"torch": fake_torch}):
         module = importlib.import_module("pybench.pytorch_bench")
     return module, fake_torch
+
+
+def make_incomplete_torch():
+    fake_torch = types.ModuleType("torch")
+    fake_torch.__version__ = "incomplete"
+    return fake_torch
 
 
 class PyTorchBenchTests(unittest.TestCase):
@@ -258,6 +269,68 @@ class PyTorchBenchTests(unittest.TestCase):
         self.assertNotEqual(bad_mb.exit_code, 0)
         self.assertIn("Invalid value for '--memory-mb'", bad_mb.output)
 
+    def test_cli_reports_incomplete_torch_installation(self):
+        module, _ = load_bench_module(make_incomplete_torch())
+        runner = CliRunner()
+
+        result = runner.invoke(module.main, ["--iterations", "1", "--size", "1"])
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("PyTorch import is incomplete", result.output)
+        self.assertIn("missing required attributes", result.output)
+
+    def test_backend_detection_handles_missing_optional_namespaces(self):
+        fake_torch = make_fake_torch()
+        del fake_torch.cuda
+        del fake_torch.backends
+        del fake_torch.mps
+        module, _ = load_bench_module(fake_torch)
+        logger = types.SimpleNamespace(info=mock.Mock(), warning=mock.Mock())
+
+        module.log_environment_info(logger)
+        devices = module.get_devices()
+
+        messages = [call.args[0] for call in logger.info.call_args_list]
+        self.assertIn("CUDA available: False", messages)
+        self.assertEqual([str(device) for device in devices], ["cpu"])
+
+    def test_filter_devices_matches_device_type_and_exact_device_spec(self):
+        module, fake_torch = load_bench_module()
+        devices = [
+            fake_torch.device("cpu"),
+            fake_torch.device("cuda:0"),
+            fake_torch.device("cuda:1"),
+            fake_torch.device("mps"),
+        ]
+
+        all_devices = module.filter_devices(devices, None)
+        cuda_devices = module.filter_devices(devices, "cuda")
+        exact_cuda_device = module.filter_devices(devices, "cuda:1")
+        mps_devices = module.filter_devices(devices, "MPS")
+
+        self.assertEqual(
+            [str(device) for device in all_devices],
+            ["cpu", "cuda:0", "cuda:1", "mps"],
+        )
+        self.assertEqual(
+            [str(device) for device in cuda_devices],
+            ["cuda:0", "cuda:1"],
+        )
+        self.assertEqual([str(device) for device in exact_cuda_device], ["cuda:1"])
+        self.assertEqual([str(device) for device in mps_devices], ["mps"])
+
+    def test_cli_rejects_unmatched_device_filter(self):
+        module, _ = load_bench_module()
+        runner = CliRunner()
+
+        result = runner.invoke(
+            module.main,
+            ["--device", "cuda", "--iterations", "1", "--size", "2"],
+        )
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("No detected devices match --device 'cuda'", result.output)
+
     def test_setup_logger_is_idempotent(self):
         module, _ = load_bench_module()
         logger = logging.getLogger("bench")
@@ -303,6 +376,14 @@ class PyTorchBenchTests(unittest.TestCase):
             list(module.BASIC_SUITE + module.EXTENDED_SUITE),
         )
         self.assertEqual(memory_ops, [])
+
+    def test_cli_suite_choices_match_suite_constant(self):
+        module, _ = load_bench_module()
+        suite_option = next(
+            param for param in module.main.params if "--suite" in param.opts
+        )
+
+        self.assertEqual(suite_option.type.choices, module.SUITE_CHOICES)
 
     def test_log_environment_info_includes_cuda_properties(self):
         fake_torch = make_fake_torch()
@@ -368,6 +449,19 @@ class PyTorchBenchTests(unittest.TestCase):
             (3750, 5000, "torch.mps"),
         )
 
+    def test_cuda_memory_info_estimates_when_mem_get_info_is_unavailable(self):
+        fake_torch = make_fake_torch()
+        fake_torch.cuda.mem_get_info = None
+        module, _ = load_bench_module(fake_torch)
+
+        available, total, source = module.get_device_memory_info(
+            fake_torch.device("cuda:0")
+        )
+
+        self.assertEqual(total, 8 * 1024**3)
+        self.assertEqual(available, total - 3 * 1024**2)
+        self.assertEqual(source, "torch.cuda memory estimate")
+
     def test_calculate_memory_target_uses_percent_and_mb_override(self):
         module, fake_torch = load_bench_module()
         device = fake_torch.device("cpu")
@@ -390,6 +484,59 @@ class PyTorchBenchTests(unittest.TestCase):
 
         self.assertEqual((target, available, total, source), (700, 1000, 2000, "test"))
         self.assertEqual(overridden, 10 * 1024**2)
+
+    def test_calculate_memory_target_rejects_zero_detected_target(self):
+        module, fake_torch = load_bench_module()
+        device = fake_torch.device("cpu")
+
+        with mock.patch.object(
+            module,
+            "get_device_memory_info",
+            return_value=(0, 2000, "test"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "No available memory"):
+                module.calculate_memory_target_bytes(
+                    device,
+                    memory_percent=70.0,
+                    memory_mb=None,
+                )
+
+    def test_allocate_memory_chunks_ceilings_to_target_and_reports_actual_bytes(self):
+        module, fake_torch = load_bench_module()
+        device = fake_torch.device("cpu")
+
+        with mock.patch.object(module, "MAX_MEMORY_CHUNK_BYTES", 6):
+            chunks, allocated_bytes = module.allocate_memory_chunks(
+                target_bytes=5,
+                device=device,
+                dt=fake_torch.float32,
+            )
+
+        self.assertEqual(len(chunks), 2)
+        self.assertGreaterEqual(allocated_bytes, 5)
+        self.assertEqual(
+            allocated_bytes,
+            sum(tensor.numel() * tensor.element_size() for tensor in chunks),
+        )
+
+    def test_allocate_memory_chunks_cleans_partial_allocations_on_failure(self):
+        module, fake_torch = load_bench_module()
+        device = fake_torch.device("cuda:0")
+        successful_chunk = FakeTensor("partial", elements=1, element_size=4)
+        fake_torch.empty.side_effect = [successful_chunk, RuntimeError("out of memory")]
+
+        with (
+            mock.patch.object(module, "MAX_MEMORY_CHUNK_BYTES", 4),
+            mock.patch.object(module, "clear_device_cache") as clear_device_cache,
+            self.assertRaisesRegex(RuntimeError, "out of memory"),
+        ):
+            module.allocate_memory_chunks(
+                target_bytes=8,
+                device=device,
+                dt=fake_torch.float32,
+            )
+
+        clear_device_cache.assert_called_once_with(device)
 
     def test_run_memory_stress_allocates_touches_logs_and_releases(self):
         module, fake_torch = load_bench_module()
@@ -482,6 +629,7 @@ class PyTorchBenchTests(unittest.TestCase):
                 memory_percent=70.0,
                 memory_mb=None,
                 seed=123,
+                device=None,
                 verbose=False,
             )
 
@@ -489,6 +637,95 @@ class PyTorchBenchTests(unittest.TestCase):
             "Skipping FP64 benchmark on MPS (mps): unsupported."
         )
         self.assertEqual(benchmark_op.call_count, 4)
+
+    def test_main_device_filter_applies_to_compute_and_memory_suites(self):
+        module, fake_torch = load_bench_module()
+        logger = types.SimpleNamespace(info=mock.Mock(), warning=mock.Mock())
+        cpu_device = fake_torch.device("cpu")
+        cuda_device = fake_torch.device("cuda:0")
+        basic_op = ("basic", lambda: None)
+        extended_op = ("extended", lambda: None)
+
+        with (
+            mock.patch.object(module, "setup_logger", return_value=logger),
+            mock.patch.object(
+                module,
+                "get_devices",
+                return_value=[cpu_device, cuda_device],
+            ),
+            mock.patch.object(
+                module,
+                "build_basic_ops",
+                return_value=[basic_op],
+            ) as build_basic_ops,
+            mock.patch.object(
+                module,
+                "build_extended_ops",
+                return_value=[extended_op],
+            ) as build_extended_ops,
+            mock.patch.object(module, "benchmark_op") as benchmark_op,
+            mock.patch.object(module, "run_memory_stress") as run_memory_stress,
+        ):
+            module.main.callback(
+                iterations=1,
+                size=2,
+                dtype="float",
+                suite="full",
+                memory_percent=70.0,
+                memory_mb=None,
+                seed=123,
+                device="cpu",
+                verbose=False,
+            )
+
+        build_basic_ops.assert_called_once_with(2, cpu_device, fake_torch.float32)
+        build_extended_ops.assert_called_once_with(2, cpu_device, fake_torch.float32)
+        self.assertEqual(
+            [call.args[2] for call in benchmark_op.call_args_list],
+            [cpu_device, cpu_device],
+        )
+        run_memory_stress.assert_called_once_with(
+            cpu_device,
+            fake_torch.float32,
+            1,
+            70.0,
+            None,
+            logger,
+        )
+
+    def test_main_uses_float32_memory_stress_dtype_for_mps_float64(self):
+        module, fake_torch = load_bench_module()
+        logger = types.SimpleNamespace(info=mock.Mock(), warning=mock.Mock())
+        device = fake_torch.device("mps")
+
+        with (
+            mock.patch.object(module, "setup_logger", return_value=logger),
+            mock.patch.object(module, "get_devices", return_value=[device]),
+            mock.patch.object(module, "run_memory_stress") as run_memory_stress,
+        ):
+            module.main.callback(
+                iterations=1,
+                size=2,
+                dtype="double",
+                suite="memory",
+                memory_percent=70.0,
+                memory_mb=None,
+                seed=123,
+                device=None,
+                verbose=False,
+            )
+
+        logger.warning.assert_called_once_with(
+            "[mps] Using float32 for memory stress because MPS does not support FP64."
+        )
+        run_memory_stress.assert_called_once_with(
+            device,
+            fake_torch.float32,
+            1,
+            70.0,
+            None,
+            logger,
+        )
 
 
 if __name__ == "__main__":

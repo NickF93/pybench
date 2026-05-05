@@ -16,9 +16,22 @@ import torch
 
 BASIC_SUITE = ("matmul", "add", "mul", "sum")
 EXTENDED_SUITE = ("dot", "transpose", "relu", "rand", "conv2d", "model_forward")
+SUITE_CHOICES = ("basic", "extended", "all", "memory", "full")
+DTYPE_CHOICES = ("float", "double", "half")
 COMPUTE_SUITES = ("basic", "extended", "all", "full")
 MEMORY_SUITES = ("memory", "full")
 MAX_MEMORY_CHUNK_BYTES = 256 * 1024**2
+REQUIRED_TORCH_ATTRIBUTES = (
+    "device",
+    "manual_seed",
+    "randn",
+    "rand",
+    "empty",
+    "float16",
+    "float32",
+    "float64",
+    "nn",
+)
 
 
 class ColoredFormatter(Formatter):
@@ -49,31 +62,85 @@ def setup_logger(level=logging.INFO):
     return logger
 
 
+def validate_torch_installation():
+    missing = [
+        f"torch.{name}" for name in REQUIRED_TORCH_ATTRIBUTES if not hasattr(torch, name)
+    ]
+    if missing:
+        raise click.ClickException(
+            "PyTorch import is incomplete; activate an environment with a full "
+            "PyTorch installation "
+            f"(missing required attributes: {', '.join(missing)})."
+        )
+
+
+def is_cuda_available():
+    cuda = getattr(torch, "cuda", None)
+    is_available = getattr(cuda, "is_available", None)
+    return bool(is_available()) if callable(is_available) else False
+
+
+def get_mps_backend():
+    backends = getattr(torch, "backends", None)
+    return getattr(backends, "mps", None)
+
+
+def is_mps_available():
+    mps_backend = get_mps_backend()
+    is_available = getattr(mps_backend, "is_available", None)
+    return bool(is_available()) if callable(is_available) else False
+
+
 def get_devices():
     devices = [torch.device("cpu")]
-    if torch.cuda.is_available():
-        for i in range(torch.cuda.device_count()):
+    cuda = getattr(torch, "cuda", None)
+    device_count = getattr(cuda, "device_count", None)
+    if is_cuda_available() and callable(device_count):
+        for i in range(device_count()):
             devices.append(torch.device(f"cuda:{i}"))
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    if is_mps_available():
         devices.append(torch.device("mps"))
     return devices
 
 
+def device_matches_filter(device: torch.device, device_filter: str):
+    normalized_filter = device_filter.strip().lower()
+    device_type = getattr(device, "type", "").lower()
+    device_spec = str(device).lower()
+    return normalized_filter == device_type or normalized_filter == device_spec
+
+
+def filter_devices(devices, device_filter):
+    if device_filter is None or not device_filter.strip():
+        return list(devices)
+
+    matched_devices = [
+        device for device in devices if device_matches_filter(device, device_filter)
+    ]
+    if not matched_devices:
+        available_devices = ", ".join(str(device) for device in devices) or "none"
+        raise click.ClickException(
+            f"No detected devices match --device {device_filter!r}. "
+            f"Available devices: {available_devices}."
+        )
+    return matched_devices
+
+
 def log_environment_info(logger):
     logger.info(f"PyTorch version: {getattr(torch, '__version__', 'unknown')}")
-    cuda_available = torch.cuda.is_available()
+    cuda_available = is_cuda_available()
     logger.info(f"CUDA available: {cuda_available}")
     if cuda_available:
         log_cuda_devices(logger)
-    if hasattr(torch.backends, "mps"):
-        logger.info(f"MPS available: {torch.backends.mps.is_available()}")
+    logger.info(f"MPS available: {is_mps_available()}")
 
 
 def log_cuda_devices(logger):
-    device_count = torch.cuda.device_count()
+    cuda = getattr(torch, "cuda", None)
+    device_count = cuda.device_count()
     logger.info(f"CUDA devices: {device_count}")
     for idx in range(device_count):
-        props = torch.cuda.get_device_properties(idx)
+        props = cuda.get_device_properties(idx)
         total_memory_mb = props.total_memory / (1024**2)
         logger.info(
             f"CUDA device {idx}: {props.name}, memory={total_memory_mb:.1f} MB, "
@@ -84,9 +151,15 @@ def log_cuda_devices(logger):
 def sync(device: torch.device):
     # Ensure operations are finished on GPU/MPS
     if device.type == "cuda":
-        torch.cuda.synchronize(device)
+        cuda = getattr(torch, "cuda", None)
+        synchronize = getattr(cuda, "synchronize", None)
+        if callable(synchronize):
+            synchronize(device)
     elif device.type == "mps":
-        torch.mps.synchronize()
+        mps = getattr(torch, "mps", None)
+        synchronize = getattr(mps, "synchronize", None)
+        if callable(synchronize):
+            synchronize()
 
 
 def inference_context():
@@ -104,6 +177,15 @@ def get_skip_reason(device: torch.device, dt: torch.dtype):
     return None
 
 
+def get_memory_dtype(device: torch.device, dt: torch.dtype, logger):
+    if dt == torch.float64 and device.type == "mps":
+        logger.warning(
+            f"[{device}] Using float32 for memory stress because MPS does not support FP64."
+        )
+        return torch.float32
+    return dt
+
+
 def bytes_to_mb(size_bytes):
     return size_bytes / (1024**2)
 
@@ -112,12 +194,20 @@ def bytes_to_gib(size_bytes):
     return size_bytes / (1024**3)
 
 
+def ceil_div(numerator, denominator):
+    return -(-numerator // denominator)
+
+
 def get_dtype_size(dt):
     if dt == torch.float16:
         return 2
     if dt == torch.float64:
         return 8
     return 4
+
+
+def tensor_nbytes(tensor):
+    return tensor.numel() * tensor.element_size()
 
 
 def benchmark_op(name, fn, device, iterations, logger):
@@ -242,22 +332,51 @@ def get_device_memory_info(device):
     if device.type == "cpu":
         return get_cpu_memory_info()
     if device.type == "cuda":
-        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-        return free_bytes, total_bytes, "torch.cuda.mem_get_info"
+        cuda = getattr(torch, "cuda", None)
+        if cuda is None:
+            return None, None, "torch.cuda unavailable"
+        mem_get_info = getattr(cuda, "mem_get_info", None)
+        if callable(mem_get_info):
+            free_bytes, total_bytes = mem_get_info(device)
+            return free_bytes, total_bytes, "torch.cuda.mem_get_info"
+        return estimate_cuda_memory_info(device)
     if device.type == "mps":
-        recommended_max_memory = getattr(torch.mps, "recommended_max_memory", None)
-        if recommended_max_memory is None:
+        mps = getattr(torch, "mps", None)
+        recommended_max_memory = getattr(mps, "recommended_max_memory", None)
+        if not callable(recommended_max_memory):
             return None, None, "torch.mps.recommended_max_memory unavailable"
         total_bytes = recommended_max_memory()
-        driver_allocated_memory = getattr(torch.mps, "driver_allocated_memory", None)
-        current_allocated_memory = getattr(torch.mps, "current_allocated_memory", None)
+        driver_allocated_memory = getattr(mps, "driver_allocated_memory", None)
+        current_allocated_memory = getattr(mps, "current_allocated_memory", None)
         used_bytes = 0
-        if driver_allocated_memory is not None:
+        if callable(driver_allocated_memory):
             used_bytes = driver_allocated_memory()
-        elif current_allocated_memory is not None:
+        elif callable(current_allocated_memory):
             used_bytes = current_allocated_memory()
         return max(total_bytes - used_bytes, 0), total_bytes, "torch.mps"
     return None, None, "unsupported"
+
+
+def estimate_cuda_memory_info(device):
+    cuda = getattr(torch, "cuda", None)
+    get_device_properties = getattr(cuda, "get_device_properties", None)
+    if not callable(get_device_properties):
+        return None, None, "torch.cuda.mem_get_info unavailable"
+
+    props = get_device_properties(device)
+    total_bytes = getattr(props, "total_memory", None)
+    if total_bytes is None:
+        return None, None, "torch.cuda.total_memory unavailable"
+
+    memory_reserved = getattr(cuda, "memory_reserved", None)
+    memory_allocated = getattr(cuda, "memory_allocated", None)
+    if callable(memory_reserved):
+        used_bytes = memory_reserved(device)
+    elif callable(memory_allocated):
+        used_bytes = memory_allocated(device)
+    else:
+        used_bytes = 0
+    return max(total_bytes - used_bytes, 0), total_bytes, "torch.cuda memory estimate"
 
 
 def calculate_memory_target_bytes(device, memory_percent, memory_mb):
@@ -266,62 +385,85 @@ def calculate_memory_target_bytes(device, memory_percent, memory_mb):
         return memory_mb * 1024**2, available_bytes, total_bytes, source
     if available_bytes is None:
         raise RuntimeError(f"Could not determine available memory for {device}.")
-    return int(available_bytes * (memory_percent / 100.0)), available_bytes, total_bytes, source
+    if available_bytes <= 0:
+        raise RuntimeError(
+            f"No available memory detected for {device} (source={source})."
+        )
+    target_bytes = int(available_bytes * (memory_percent / 100.0))
+    if target_bytes <= 0:
+        raise RuntimeError(
+            f"No available memory target for {device} (source={source})."
+        )
+    return target_bytes, available_bytes, total_bytes, source
 
 
 def reset_peak_memory_stats(device):
     if device.type != "cuda":
         return
-    reset_peak = getattr(torch.cuda, "reset_peak_memory_stats", None)
-    if reset_peak is not None:
+    cuda = getattr(torch, "cuda", None)
+    reset_peak = getattr(cuda, "reset_peak_memory_stats", None)
+    if callable(reset_peak):
         reset_peak(device)
 
 
 def get_memory_stats(device):
     stats = {}
     if device.type == "cuda":
+        cuda = getattr(torch, "cuda", None)
         for name in (
             "memory_allocated",
             "max_memory_allocated",
             "memory_reserved",
             "max_memory_reserved",
         ):
-            fn = getattr(torch.cuda, name, None)
-            if fn is not None:
+            fn = getattr(cuda, name, None)
+            if callable(fn):
                 stats[name] = fn(device)
     elif device.type == "mps":
+        mps = getattr(torch, "mps", None)
         for name in ("current_allocated_memory", "driver_allocated_memory"):
-            fn = getattr(torch.mps, name, None)
-            if fn is not None:
+            fn = getattr(mps, name, None)
+            if callable(fn):
                 stats[name] = fn()
     return stats
 
 
 def clear_device_cache(device):
     if device.type == "cuda":
-        empty_cache = getattr(torch.cuda, "empty_cache", None)
+        backend = getattr(torch, "cuda", None)
     elif device.type == "mps":
-        empty_cache = getattr(torch.mps, "empty_cache", None)
+        backend = getattr(torch, "mps", None)
     else:
-        empty_cache = None
-    if empty_cache is not None:
+        backend = None
+    empty_cache = getattr(backend, "empty_cache", None)
+    if callable(empty_cache):
         empty_cache()
     gc.collect()
 
 
 def allocate_memory_chunks(target_bytes, device, dt):
+    if target_bytes <= 0:
+        raise RuntimeError("Memory target must be greater than zero.")
     element_size = get_dtype_size(dt)
-    target_elements = max(1, target_bytes // element_size)
+    target_elements = max(1, ceil_div(target_bytes, element_size))
     max_chunk_elements = max(1, MAX_MEMORY_CHUNK_BYTES // element_size)
     chunks = []
     allocated_elements = 0
 
-    while allocated_elements < target_elements:
-        chunk_elements = min(max_chunk_elements, target_elements - allocated_elements)
-        chunks.append(torch.empty((chunk_elements,), device=device, dtype=dt))
-        allocated_elements += chunk_elements
+    try:
+        while allocated_elements < target_elements:
+            chunk_elements = min(
+                max_chunk_elements,
+                target_elements - allocated_elements,
+            )
+            chunks.append(torch.empty((chunk_elements,), device=device, dtype=dt))
+            allocated_elements += chunk_elements
+    except Exception:
+        chunks.clear()
+        clear_device_cache(device)
+        raise
 
-    return chunks, allocated_elements * element_size
+    return chunks, sum(tensor_nbytes(chunk) for chunk in chunks)
 
 
 def touch_memory_chunks(chunks, allocated_bytes, iterations, device):
@@ -362,7 +504,9 @@ def run_memory_stress(device, dt, iterations, memory_percent, memory_mb, logger)
             f"(source={source})"
         )
         if available_bytes is not None:
-            total_text = "unknown" if total_bytes is None else f"{bytes_to_mb(total_bytes):.1f} MB"
+            total_text = (
+                "unknown" if total_bytes is None else f"{bytes_to_mb(total_bytes):.1f} MB"
+            )
             logger.info(
                 f"[{device}] memory available={bytes_to_mb(available_bytes):.1f} MB, "
                 f"total={total_text}"
@@ -402,14 +546,14 @@ def run_memory_stress(device, dt, iterations, memory_percent, memory_mb, logger)
 )
 @click.option(
     "--dtype", default="float", show_default=True,
-    type=click.Choice(["float", "double", "half"]),
+    type=click.Choice(DTYPE_CHOICES),
     help="Data type for tensors.",
 )
 @click.option(
     "--suite",
     default="basic",
     show_default=True,
-    type=click.Choice(["basic", "extended", "all", "memory", "full"]),
+    type=click.Choice(SUITE_CHOICES),
     help="Benchmark suite to run.",
 )
 @click.option(
@@ -431,7 +575,7 @@ def run_memory_stress(device, dt, iterations, memory_percent, memory_mb, logger)
 )
 @click.option(
     "--device", default=None, show_default=True,
-    help="Specify the device to test"
+    help="Device filter to run, for example cpu, cuda, cuda:0, or mps.",
 )
 @click.option(
     "--verbose", is_flag=True,
@@ -454,51 +598,53 @@ def main(
     level = logging.DEBUG if verbose else logging.INFO
     logger = setup_logger(level)
 
+    validate_torch_installation()
     log_environment_info(logger)
 
     torch.manual_seed(seed)
-    devices = get_devices()
-    if device is not None:
-        devices = [dev for dev in devices if dev.type.startswith(device)]
+    devices = filter_devices(get_devices(), device)
     logger.info(f"Detected devices: {devices}")
 
     # Map dtype strings to torch dtypes
     dtype_map = {"float": torch.float32, "double": torch.float64, "half": torch.float16}
     dt = dtype_map[dtype]
 
-    for device in devices:
-        logger.info(f"\nBenchmarking on device: {device}")
+    for bench_device in devices:
+        logger.info(f"\nBenchmarking on device: {bench_device}")
 
         if suite in COMPUTE_SUITES:
-            skip_reason = get_skip_reason(device, dt)
+            skip_reason = get_skip_reason(bench_device, dt)
             if skip_reason:
                 logger.warning(skip_reason)
             else:
                 if suite in ("basic", "all", "full"):
                     run_operations(
-                        build_basic_ops(size, device, dt),
-                        device,
+                        build_basic_ops(size, bench_device, dt),
+                        bench_device,
                         iterations,
                         logger,
                     )
                 if suite in ("extended", "all", "full"):
                     try:
-                        extended_ops = build_extended_ops(size, device, dt)
+                        extended_ops = build_extended_ops(size, bench_device, dt)
                     except Exception as exc:
-                        logger.warning(f"[{device}] Skipping extended suite: {exc}")
+                        logger.warning(
+                            f"[{bench_device}] Skipping extended suite: {exc}"
+                        )
                     else:
                         run_operations(
                             extended_ops,
-                            device,
+                            bench_device,
                             iterations,
                             logger,
                             skip_failed_ops=True,
                         )
 
         if suite in MEMORY_SUITES:
+            memory_dt = get_memory_dtype(bench_device, dt, logger)
             run_memory_stress(
-                device,
-                dt,
+                bench_device,
+                memory_dt,
                 iterations,
                 memory_percent,
                 memory_mb,

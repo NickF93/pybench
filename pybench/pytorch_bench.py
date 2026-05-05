@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import importlib
 import time
 import statistics
 import logging
 import gc
+import math
 import os
 from contextlib import nullcontext
+from dataclasses import dataclass
 from logging import StreamHandler, Formatter
+from typing import Callable
 
 import click
 from colorama import Fore, Style, init as colorama_init
@@ -16,11 +20,25 @@ import torch
 
 BASIC_SUITE = ("matmul", "add", "mul", "sum")
 EXTENDED_SUITE = ("dot", "transpose", "relu", "rand", "conv2d", "model_forward")
+MODE_CHOICES = ("stress", "benchmark")
 SUITE_CHOICES = ("basic", "extended", "all", "memory", "full")
 DTYPE_CHOICES = ("float", "double", "half")
 COMPUTE_SUITES = ("basic", "extended", "all", "full")
 MEMORY_SUITES = ("memory", "full")
 MAX_MEMORY_CHUNK_BYTES = 256 * 1024**2
+BENCHMARK_VERSION = "pybench-v1"
+BENCHMARK_DEFAULT_MIN_TIME = 0.5
+BENCHMARK_WARMUP_RUNS = 3
+BENCHMARK_MEMORY_DEFAULT_MB = 256
+BENCHMARK_MEMORY_AVAILABLE_FRACTION = 0.10
+BENCHMARK_BASELINES = {
+    "matmul_1024": 150.0,
+    "elementwise_add_16m": 25.0,
+    "reduction_sum_16m": 20.0,
+    "conv2d_128": 750.0,
+    "memory_fill": 20.0,
+    "memory_read": 20.0,
+}
 REQUIRED_TORCH_ATTRIBUTES = (
     "device",
     "manual_seed",
@@ -32,6 +50,35 @@ REQUIRED_TORCH_ATTRIBUTES = (
     "float64",
     "nn",
 )
+
+
+@dataclass(frozen=True)
+class BenchmarkTest:
+    name: str
+    category: str
+    fn: Callable[[], object]
+    work_units: float
+    throughput_unit: str
+    baseline: float
+
+
+@dataclass(frozen=True)
+class BenchmarkResult:
+    name: str
+    category: str
+    device: torch.device
+    median_time: float
+    iqr_time: float
+    throughput: float
+    throughput_unit: str
+    score: float
+
+
+@dataclass(frozen=True)
+class BenchmarkSummary:
+    compute_score: float | None
+    memory_score: float | None
+    final_score: float | None
 
 
 class ColoredFormatter(Formatter):
@@ -208,6 +255,356 @@ def get_dtype_size(dt):
 
 def tensor_nbytes(tensor):
     return tensor.numel() * tensor.element_size()
+
+
+def get_torch_benchmark_timer():
+    try:
+        benchmark_module = importlib.import_module("torch.utils.benchmark")
+    except ImportError:
+        benchmark_module = getattr(getattr(torch, "utils", None), "benchmark", None)
+    return getattr(benchmark_module, "Timer", None)
+
+
+def percentile(values, fraction):
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    if len(ordered) == 1:
+        return ordered[0]
+
+    position = (len(ordered) - 1) * fraction
+    lower_index = math.floor(position)
+    upper_index = math.ceil(position)
+    if lower_index == upper_index:
+        return ordered[lower_index]
+
+    lower_value = ordered[lower_index]
+    upper_value = ordered[upper_index]
+    return lower_value + (upper_value - lower_value) * (position - lower_index)
+
+
+def calculate_iqr(values):
+    if len(values) < 4:
+        return 0.0
+    return percentile(values, 0.75) - percentile(values, 0.25)
+
+
+def geometric_mean(values):
+    positive_values = [value for value in values if value > 0]
+    if not positive_values:
+        return None
+    return math.exp(
+        sum(math.log(value) for value in positive_values) / len(positive_values)
+    )
+
+
+def format_optional_score(score):
+    if score is None:
+        return "n/a"
+    return f"{score:.1f}"
+
+
+def measure_benchmark_test(benchmark_test, device, min_run_time):
+    timer_class = get_torch_benchmark_timer()
+    if callable(timer_class):
+        with inference_context():
+            sync(device)
+
+            def timed_fn():
+                result = benchmark_test.fn()
+                sync(device)
+                return result
+
+            timer = timer_class(
+                stmt="timed_fn()",
+                globals={"timed_fn": timed_fn},
+            )
+            measurement = timer.blocked_autorange(min_run_time=min_run_time)
+            sync(device)
+        return float(measurement.median), float(getattr(measurement, "iqr", 0.0))
+
+    return measure_benchmark_test_fallback(benchmark_test, device, min_run_time)
+
+
+def measure_benchmark_test_fallback(benchmark_test, device, min_run_time):
+    times = []
+    with inference_context():
+        for _ in range(BENCHMARK_WARMUP_RUNS):
+            benchmark_test.fn()
+            sync(device)
+
+        started_at = time.perf_counter()
+        while len(times) < 3 or time.perf_counter() - started_at < min_run_time:
+            iteration_started_at = time.perf_counter()
+            benchmark_test.fn()
+            sync(device)
+            times.append(time.perf_counter() - iteration_started_at)
+
+    return statistics.median(times), calculate_iqr(times)
+
+
+def make_benchmark_result(benchmark_test, device, median_time, iqr_time):
+    throughput = benchmark_test.work_units / median_time if median_time > 0 else 0.0
+    score = (
+        1000.0 * throughput / benchmark_test.baseline
+        if benchmark_test.baseline > 0
+        else 0.0
+    )
+    return BenchmarkResult(
+        name=benchmark_test.name,
+        category=benchmark_test.category,
+        device=device,
+        median_time=median_time,
+        iqr_time=iqr_time,
+        throughput=throughput,
+        throughput_unit=benchmark_test.throughput_unit,
+        score=score,
+    )
+
+
+def log_benchmark_result(logger, result):
+    logger.info(
+        f"[{result.device}] benchmark {result.name}: "
+        f"median={result.median_time:.6f}s, iqr={result.iqr_time:.6f}s, "
+        f"throughput={result.throughput:.3f} {result.throughput_unit}, "
+        f"score={result.score:.1f}"
+    )
+
+
+def run_benchmark_tests(benchmark_tests, device, min_run_time, logger):
+    results = []
+    for benchmark_test in benchmark_tests:
+        try:
+            median_time, iqr_time = measure_benchmark_test(
+                benchmark_test,
+                device,
+                min_run_time,
+            )
+            result = make_benchmark_result(
+                benchmark_test,
+                device,
+                median_time,
+                iqr_time,
+            )
+        except Exception as exc:
+            logger.warning(f"[{device}] Skipping benchmark {benchmark_test.name}: {exc}")
+            continue
+
+        log_benchmark_result(logger, result)
+        results.append(result)
+    return results
+
+
+def summarize_benchmark_scores(compute_results, memory_results):
+    compute_score = geometric_mean(result.score for result in compute_results)
+    memory_score = geometric_mean(result.score for result in memory_results)
+
+    final_inputs = []
+    if compute_score is not None:
+        final_inputs.append(compute_score)
+    if memory_score is not None:
+        final_inputs.append(memory_score)
+    final_score = geometric_mean(final_inputs)
+
+    return BenchmarkSummary(
+        compute_score=compute_score,
+        memory_score=memory_score,
+        final_score=final_score,
+    )
+
+
+def log_benchmark_summary(logger, device, summary):
+    logger.info(
+        f"[{device}] {BENCHMARK_VERSION} score: "
+        f"compute={format_optional_score(summary.compute_score)}, "
+        f"memory={format_optional_score(summary.memory_score)}, "
+        f"final={format_optional_score(summary.final_score)}"
+    )
+
+
+def build_benchmark_compute_tests(device, dt):
+    matmul_size = 1024
+    vector_elements = 4096 * 4096
+    conv_batch_size = 8
+    conv_image_size = 128
+    dtype_size = get_dtype_size(dt)
+
+    matmul_a = torch.randn((matmul_size, matmul_size), device=device, dtype=dt)
+    matmul_b = torch.randn((matmul_size, matmul_size), device=device, dtype=dt)
+    add_a = torch.randn((vector_elements,), device=device, dtype=dt)
+    add_b = torch.randn((vector_elements,), device=device, dtype=dt)
+    reduction_input = torch.randn((vector_elements,), device=device, dtype=dt)
+    image_batch = torch.randn(
+        (conv_batch_size, 3, conv_image_size, conv_image_size),
+        device=device,
+        dtype=dt,
+    )
+    conv = torch.nn.Conv2d(3, 16, kernel_size=3, padding=1).to(
+        device=device,
+        dtype=dt,
+    )
+
+    matmul_gflop = (2 * matmul_size**3) / 1e9
+    elementwise_gib = bytes_to_gib(3 * vector_elements * dtype_size)
+    reduction_gib = bytes_to_gib(vector_elements * dtype_size)
+
+    return [
+        BenchmarkTest(
+            name="matmul_1024",
+            category="compute",
+            fn=lambda: matmul_a @ matmul_b,
+            work_units=matmul_gflop,
+            throughput_unit="GFLOP/s",
+            baseline=BENCHMARK_BASELINES["matmul_1024"],
+        ),
+        BenchmarkTest(
+            name="elementwise_add_16m",
+            category="compute",
+            fn=lambda: add_a + add_b,
+            work_units=elementwise_gib,
+            throughput_unit="GiB/s",
+            baseline=BENCHMARK_BASELINES["elementwise_add_16m"],
+        ),
+        BenchmarkTest(
+            name="reduction_sum_16m",
+            category="compute",
+            fn=lambda: reduction_input.sum(),
+            work_units=reduction_gib,
+            throughput_unit="GiB/s",
+            baseline=BENCHMARK_BASELINES["reduction_sum_16m"],
+        ),
+        BenchmarkTest(
+            name="conv2d_128",
+            category="compute",
+            fn=lambda: conv(image_batch),
+            work_units=float(conv_batch_size),
+            throughput_unit="images/s",
+            baseline=BENCHMARK_BASELINES["conv2d_128"],
+        ),
+    ]
+
+
+def calculate_benchmark_memory_target_bytes(device, memory_mb):
+    available_bytes, total_bytes, source = get_device_memory_info(device)
+    if memory_mb is not None:
+        return memory_mb * 1024**2, available_bytes, total_bytes, source
+
+    default_bytes = BENCHMARK_MEMORY_DEFAULT_MB * 1024**2
+    if available_bytes is None or available_bytes <= 0:
+        return default_bytes, available_bytes, total_bytes, source
+
+    target_bytes = min(
+        default_bytes,
+        int(available_bytes * BENCHMARK_MEMORY_AVAILABLE_FRACTION),
+    )
+    return max(target_bytes, 1), available_bytes, total_bytes, source
+
+
+def build_benchmark_memory_tests(device, dt, memory_mb, logger):
+    target_bytes, available_bytes, total_bytes, source = (
+        calculate_benchmark_memory_target_bytes(device, memory_mb)
+    )
+    logger.info(
+        f"[{device}] benchmark memory target={bytes_to_mb(target_bytes):.1f} MB "
+        f"(source={source})"
+    )
+    if available_bytes is not None:
+        total_text = "unknown" if total_bytes is None else f"{bytes_to_mb(total_bytes):.1f} MB"
+        logger.info(
+            f"[{device}] benchmark memory available="
+            f"{bytes_to_mb(available_bytes):.1f} MB, total={total_text}"
+        )
+
+    chunks, allocated_bytes = allocate_memory_chunks(target_bytes, device, dt)
+    work_units = bytes_to_gib(allocated_bytes)
+
+    def fill_chunks():
+        for chunk in chunks:
+            chunk.fill_(1.0)
+
+    def read_chunks():
+        total = None
+        for chunk in chunks:
+            value = chunk.sum()
+            total = value if total is None else total + value
+        return total
+
+    return [
+        BenchmarkTest(
+            name="memory_fill",
+            category="memory",
+            fn=fill_chunks,
+            work_units=work_units,
+            throughput_unit="GiB/s",
+            baseline=BENCHMARK_BASELINES["memory_fill"],
+        ),
+        BenchmarkTest(
+            name="memory_read",
+            category="memory",
+            fn=read_chunks,
+            work_units=work_units,
+            throughput_unit="GiB/s",
+            baseline=BENCHMARK_BASELINES["memory_read"],
+        ),
+    ], chunks
+
+
+def run_benchmark_mode(
+    devices,
+    dt,
+    benchmark_memory,
+    memory_mb,
+    benchmark_min_time,
+    logger,
+):
+    summaries = {}
+    for device in devices:
+        logger.info(f"\nBenchmarking score on device: {device} ({BENCHMARK_VERSION})")
+        skip_reason = get_skip_reason(device, dt)
+        if skip_reason:
+            logger.warning(skip_reason)
+            continue
+
+        try:
+            compute_tests = build_benchmark_compute_tests(device, dt)
+            compute_results = run_benchmark_tests(
+                compute_tests,
+                device,
+                benchmark_min_time,
+                logger,
+            )
+        except Exception as exc:
+            logger.warning(f"[{device}] Benchmark compute failed: {exc}")
+            compute_results = []
+
+        memory_results = []
+        memory_chunks = []
+        if benchmark_memory:
+            try:
+                memory_dt = get_memory_dtype(device, dt, logger)
+                memory_tests, memory_chunks = build_benchmark_memory_tests(
+                    device,
+                    memory_dt,
+                    memory_mb,
+                    logger,
+                )
+                memory_results = run_benchmark_tests(
+                    memory_tests,
+                    device,
+                    benchmark_min_time,
+                    logger,
+                )
+            except (RuntimeError, MemoryError, TypeError) as exc:
+                logger.warning(f"[{device}] Skipping benchmark memory: {exc}")
+            finally:
+                if memory_chunks:
+                    release_memory_chunks(memory_chunks, device)
+
+        summary = summarize_benchmark_scores(compute_results, memory_results)
+        summaries[device] = summary
+        log_benchmark_summary(logger, device, summary)
+
+    return summaries
 
 
 def benchmark_op(name, fn, device, iterations, logger):
@@ -550,6 +947,13 @@ def run_memory_stress(device, dt, iterations, memory_percent, memory_mb, logger)
     help="Data type for tensors.",
 )
 @click.option(
+    "--mode",
+    default="stress",
+    show_default=True,
+    type=click.Choice(MODE_CHOICES),
+    help="Run stress tests or the fixed-score benchmark profile.",
+)
+@click.option(
     "--suite",
     default="basic",
     show_default=True,
@@ -578,6 +982,18 @@ def run_memory_stress(device, dt, iterations, memory_percent, memory_mb, logger)
     help="Device filter to run, for example cpu, cuda, cuda:0, or mps.",
 )
 @click.option(
+    "--benchmark-memory",
+    is_flag=True,
+    help="Include the fixed memory bandwidth tests in benchmark mode.",
+)
+@click.option(
+    "--benchmark-min-time",
+    default=BENCHMARK_DEFAULT_MIN_TIME,
+    show_default=True,
+    type=click.FloatRange(min=0.001),
+    help="Minimum timing duration per benchmark subtest.",
+)
+@click.option(
     "--verbose", is_flag=True,
     help="Enable DEBUG logging.",
 )
@@ -585,11 +1001,14 @@ def main(
     iterations: int,
     size: int,
     dtype: str,
+    mode: str,
     suite: str,
     memory_percent: float,
     memory_mb: int | None,
     seed: int,
     device: str | None,
+    benchmark_memory: bool,
+    benchmark_min_time: float,
     verbose: bool,
 ):
     """
@@ -608,6 +1027,17 @@ def main(
     # Map dtype strings to torch dtypes
     dtype_map = {"float": torch.float32, "double": torch.float64, "half": torch.float16}
     dt = dtype_map[dtype]
+
+    if mode == "benchmark":
+        run_benchmark_mode(
+            devices,
+            dt,
+            benchmark_memory,
+            memory_mb,
+            benchmark_min_time,
+            logger,
+        )
+        return
 
     for bench_device in devices:
         logger.info(f"\nBenchmarking on device: {bench_device}")

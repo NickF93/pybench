@@ -385,6 +385,234 @@ class PyTorchBenchTests(unittest.TestCase):
 
         self.assertEqual(suite_option.type.choices, module.SUITE_CHOICES)
 
+    def test_cli_mode_choices_match_mode_constant(self):
+        module, _ = load_bench_module()
+        mode_option = next(
+            param for param in module.main.params if "--mode" in param.opts
+        )
+
+        self.assertEqual(mode_option.type.choices, module.MODE_CHOICES)
+
+    def test_geometric_mean_and_benchmark_summary_scores(self):
+        module, fake_torch = load_bench_module()
+        device = fake_torch.device("cpu")
+        compute_results = [
+            module.BenchmarkResult(
+                name="compute-a",
+                category="compute",
+                device=device,
+                median_time=1.0,
+                iqr_time=0.0,
+                throughput=1.0,
+                throughput_unit="ops/s",
+                score=100.0,
+            ),
+            module.BenchmarkResult(
+                name="compute-b",
+                category="compute",
+                device=device,
+                median_time=1.0,
+                iqr_time=0.0,
+                throughput=1.0,
+                throughput_unit="ops/s",
+                score=400.0,
+            ),
+        ]
+        memory_results = [
+            module.BenchmarkResult(
+                name="memory-a",
+                category="memory",
+                device=device,
+                median_time=1.0,
+                iqr_time=0.0,
+                throughput=1.0,
+                throughput_unit="GiB/s",
+                score=900.0,
+            )
+        ]
+
+        summary = module.summarize_benchmark_scores(compute_results, memory_results)
+
+        self.assertAlmostEqual(module.geometric_mean([100.0, 400.0]), 200.0)
+        self.assertAlmostEqual(summary.compute_score, 200.0)
+        self.assertAlmostEqual(summary.memory_score, 900.0)
+        self.assertAlmostEqual(summary.final_score, (200.0 * 900.0) ** 0.5)
+
+    def test_run_benchmark_tests_scores_throughput_and_skips_failures(self):
+        module, fake_torch = load_bench_module()
+        logger = types.SimpleNamespace(info=mock.Mock(), warning=mock.Mock())
+        device = fake_torch.device("cpu")
+        tests = [
+            module.BenchmarkTest(
+                name="bad",
+                category="compute",
+                fn=lambda: None,
+                work_units=1.0,
+                throughput_unit="ops/s",
+                baseline=1.0,
+            ),
+            module.BenchmarkTest(
+                name="good",
+                category="compute",
+                fn=lambda: None,
+                work_units=4.0,
+                throughput_unit="ops/s",
+                baseline=2.0,
+            ),
+        ]
+
+        with mock.patch.object(
+            module,
+            "measure_benchmark_test",
+            side_effect=[RuntimeError("unsupported op"), (0.5, 0.1)],
+        ):
+            results = module.run_benchmark_tests(
+                tests,
+                device,
+                min_run_time=0.25,
+                logger=logger,
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].name, "good")
+        self.assertEqual(results[0].throughput, 8.0)
+        self.assertEqual(results[0].score, 4000.0)
+        logger.warning.assert_called_once_with(
+            "[cpu] Skipping benchmark bad: unsupported op"
+        )
+
+    def test_run_benchmark_mode_runs_compute_by_default_without_memory(self):
+        module, fake_torch = load_bench_module()
+        logger = types.SimpleNamespace(info=mock.Mock(), warning=mock.Mock())
+        device = fake_torch.device("cpu")
+        compute_test = module.BenchmarkTest(
+            name="compute",
+            category="compute",
+            fn=lambda: None,
+            work_units=1.0,
+            throughput_unit="ops/s",
+            baseline=1.0,
+        )
+        compute_result = module.BenchmarkResult(
+            name="compute",
+            category="compute",
+            device=device,
+            median_time=1.0,
+            iqr_time=0.0,
+            throughput=1.0,
+            throughput_unit="ops/s",
+            score=1000.0,
+        )
+
+        with (
+            mock.patch.object(
+                module,
+                "build_benchmark_compute_tests",
+                return_value=[compute_test],
+            ) as build_compute,
+            mock.patch.object(
+                module,
+                "build_benchmark_memory_tests",
+            ) as build_memory,
+            mock.patch.object(
+                module,
+                "run_benchmark_tests",
+                return_value=[compute_result],
+            ) as run_tests,
+        ):
+            summaries = module.run_benchmark_mode(
+                [device],
+                fake_torch.float32,
+                benchmark_memory=False,
+                memory_mb=None,
+                benchmark_min_time=0.25,
+                logger=logger,
+            )
+
+        build_compute.assert_called_once_with(device, fake_torch.float32)
+        build_memory.assert_not_called()
+        run_tests.assert_called_once_with(
+            [compute_test],
+            device,
+            0.25,
+            logger,
+        )
+        self.assertAlmostEqual(summaries[device].final_score, 1000.0)
+
+    def test_run_benchmark_mode_includes_memory_when_enabled_and_releases_chunks(self):
+        module, fake_torch = load_bench_module()
+        logger = types.SimpleNamespace(info=mock.Mock(), warning=mock.Mock())
+        device = fake_torch.device("cpu")
+        chunk = FakeTensor("chunk")
+        compute_test = module.BenchmarkTest(
+            name="compute",
+            category="compute",
+            fn=lambda: None,
+            work_units=1.0,
+            throughput_unit="ops/s",
+            baseline=1.0,
+        )
+        memory_test = module.BenchmarkTest(
+            name="memory",
+            category="memory",
+            fn=lambda: None,
+            work_units=1.0,
+            throughput_unit="GiB/s",
+            baseline=1.0,
+        )
+        compute_result = module.BenchmarkResult(
+            name="compute",
+            category="compute",
+            device=device,
+            median_time=1.0,
+            iqr_time=0.0,
+            throughput=1.0,
+            throughput_unit="ops/s",
+            score=1000.0,
+        )
+        memory_result = module.BenchmarkResult(
+            name="memory",
+            category="memory",
+            device=device,
+            median_time=1.0,
+            iqr_time=0.0,
+            throughput=1.0,
+            throughput_unit="GiB/s",
+            score=250.0,
+        )
+
+        with (
+            mock.patch.object(
+                module,
+                "build_benchmark_compute_tests",
+                return_value=[compute_test],
+            ),
+            mock.patch.object(
+                module,
+                "build_benchmark_memory_tests",
+                return_value=([memory_test], [chunk]),
+            ) as build_memory,
+            mock.patch.object(
+                module,
+                "run_benchmark_tests",
+                side_effect=[[compute_result], [memory_result]],
+            ) as run_tests,
+            mock.patch.object(module, "release_memory_chunks") as release_chunks,
+        ):
+            summaries = module.run_benchmark_mode(
+                [device],
+                fake_torch.float32,
+                benchmark_memory=True,
+                memory_mb=128,
+                benchmark_min_time=0.25,
+                logger=logger,
+            )
+
+        build_memory.assert_called_once_with(device, fake_torch.float32, 128, logger)
+        self.assertEqual(run_tests.call_count, 2)
+        release_chunks.assert_called_once_with([chunk], device)
+        self.assertAlmostEqual(summaries[device].final_score, (1000.0 * 250.0) ** 0.5)
+
     def test_log_environment_info_includes_cuda_properties(self):
         fake_torch = make_fake_torch()
         fake_torch.cuda = FakeCuda(available=True, count=1)
@@ -630,6 +858,9 @@ class PyTorchBenchTests(unittest.TestCase):
                 memory_mb=None,
                 seed=123,
                 device=None,
+                mode="stress",
+                benchmark_memory=False,
+                benchmark_min_time=0.5,
                 verbose=False,
             )
 
@@ -675,6 +906,9 @@ class PyTorchBenchTests(unittest.TestCase):
                 memory_mb=None,
                 seed=123,
                 device="cpu",
+                mode="stress",
+                benchmark_memory=False,
+                benchmark_min_time=0.5,
                 verbose=False,
             )
 
@@ -712,6 +946,9 @@ class PyTorchBenchTests(unittest.TestCase):
                 memory_mb=None,
                 seed=123,
                 device=None,
+                mode="stress",
+                benchmark_memory=False,
+                benchmark_min_time=0.5,
                 verbose=False,
             )
 
@@ -724,6 +961,45 @@ class PyTorchBenchTests(unittest.TestCase):
             1,
             70.0,
             None,
+            logger,
+        )
+
+    def test_main_benchmark_mode_uses_device_filter(self):
+        module, fake_torch = load_bench_module()
+        logger = types.SimpleNamespace(info=mock.Mock(), warning=mock.Mock())
+        cpu_device = fake_torch.device("cpu")
+        cuda_device = fake_torch.device("cuda:0")
+
+        with (
+            mock.patch.object(module, "setup_logger", return_value=logger),
+            mock.patch.object(
+                module,
+                "get_devices",
+                return_value=[cpu_device, cuda_device],
+            ),
+            mock.patch.object(module, "run_benchmark_mode") as run_benchmark_mode,
+        ):
+            module.main.callback(
+                iterations=1,
+                size=2,
+                dtype="float",
+                suite="full",
+                memory_percent=70.0,
+                memory_mb=None,
+                seed=123,
+                device="cuda:0",
+                mode="benchmark",
+                benchmark_memory=True,
+                benchmark_min_time=0.25,
+                verbose=False,
+            )
+
+        run_benchmark_mode.assert_called_once_with(
+            [cuda_device],
+            fake_torch.float32,
+            True,
+            None,
+            0.25,
             logger,
         )
 

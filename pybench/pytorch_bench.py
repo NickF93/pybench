@@ -3,6 +3,8 @@ from __future__ import annotations
 import time
 import statistics
 import logging
+import gc
+import os
 from contextlib import nullcontext
 from logging import StreamHandler, Formatter
 
@@ -14,6 +16,9 @@ import torch
 
 BASIC_SUITE = ("matmul", "add", "mul", "sum")
 EXTENDED_SUITE = ("dot", "transpose", "relu", "rand", "conv2d", "model_forward")
+COMPUTE_SUITES = ("basic", "extended", "all", "full")
+MEMORY_SUITES = ("memory", "full")
+MAX_MEMORY_CHUNK_BYTES = 256 * 1024**2
 
 
 class ColoredFormatter(Formatter):
@@ -99,6 +104,22 @@ def get_skip_reason(device: torch.device, dt: torch.dtype):
     return None
 
 
+def bytes_to_mb(size_bytes):
+    return size_bytes / (1024**2)
+
+
+def bytes_to_gib(size_bytes):
+    return size_bytes / (1024**3)
+
+
+def get_dtype_size(dt):
+    if dt == torch.float16:
+        return 2
+    if dt == torch.float64:
+        return 8
+    return 4
+
+
 def benchmark_op(name, fn, device, iterations, logger):
     with inference_context():
         # Warm-up
@@ -169,9 +190,9 @@ def build_extended_ops(size, device, dt):
 
 def get_operations(suite, size, device, dt):
     ops = []
-    if suite in ("basic", "all"):
+    if suite in ("basic", "all", "full"):
         ops.extend(build_basic_ops(size, device, dt))
-    if suite in ("extended", "all"):
+    if suite in ("extended", "all", "full"):
         ops.extend(build_extended_ops(size, device, dt))
     return ops
 
@@ -184,6 +205,188 @@ def run_operations(ops, device, iterations, logger, skip_failed_ops=False):
             if not skip_failed_ops:
                 raise
             logger.warning(f"[{device}] Skipping {name}: {exc}")
+
+
+def get_cpu_memory_info():
+    mem_available = None
+    mem_total = None
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as meminfo:
+            for line in meminfo:
+                key, value = line.split(":", 1)
+                if key in ("MemAvailable", "MemTotal"):
+                    kib = int(value.strip().split()[0])
+                    if key == "MemAvailable":
+                        mem_available = kib * 1024
+                    else:
+                        mem_total = kib * 1024
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+
+    if mem_available is not None:
+        return mem_available, mem_total, "/proc/meminfo"
+
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        available_pages = os.sysconf("SC_AVPHYS_PAGES")
+        total_pages = os.sysconf("SC_PHYS_PAGES")
+    except (AttributeError, OSError, ValueError):
+        return None, None, "unavailable"
+
+    available = page_size * available_pages
+    total = page_size * total_pages
+    return available, total, "os.sysconf"
+
+
+def get_device_memory_info(device):
+    if device.type == "cpu":
+        return get_cpu_memory_info()
+    if device.type == "cuda":
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        return free_bytes, total_bytes, "torch.cuda.mem_get_info"
+    if device.type == "mps":
+        recommended_max_memory = getattr(torch.mps, "recommended_max_memory", None)
+        if recommended_max_memory is None:
+            return None, None, "torch.mps.recommended_max_memory unavailable"
+        total_bytes = recommended_max_memory()
+        driver_allocated_memory = getattr(torch.mps, "driver_allocated_memory", None)
+        current_allocated_memory = getattr(torch.mps, "current_allocated_memory", None)
+        used_bytes = 0
+        if driver_allocated_memory is not None:
+            used_bytes = driver_allocated_memory()
+        elif current_allocated_memory is not None:
+            used_bytes = current_allocated_memory()
+        return max(total_bytes - used_bytes, 0), total_bytes, "torch.mps"
+    return None, None, "unsupported"
+
+
+def calculate_memory_target_bytes(device, memory_percent, memory_mb):
+    available_bytes, total_bytes, source = get_device_memory_info(device)
+    if memory_mb is not None:
+        return memory_mb * 1024**2, available_bytes, total_bytes, source
+    if available_bytes is None:
+        raise RuntimeError(f"Could not determine available memory for {device}.")
+    return int(available_bytes * (memory_percent / 100.0)), available_bytes, total_bytes, source
+
+
+def reset_peak_memory_stats(device):
+    if device.type != "cuda":
+        return
+    reset_peak = getattr(torch.cuda, "reset_peak_memory_stats", None)
+    if reset_peak is not None:
+        reset_peak(device)
+
+
+def get_memory_stats(device):
+    stats = {}
+    if device.type == "cuda":
+        for name in (
+            "memory_allocated",
+            "max_memory_allocated",
+            "memory_reserved",
+            "max_memory_reserved",
+        ):
+            fn = getattr(torch.cuda, name, None)
+            if fn is not None:
+                stats[name] = fn(device)
+    elif device.type == "mps":
+        for name in ("current_allocated_memory", "driver_allocated_memory"):
+            fn = getattr(torch.mps, name, None)
+            if fn is not None:
+                stats[name] = fn()
+    return stats
+
+
+def clear_device_cache(device):
+    if device.type == "cuda":
+        empty_cache = getattr(torch.cuda, "empty_cache", None)
+    elif device.type == "mps":
+        empty_cache = getattr(torch.mps, "empty_cache", None)
+    else:
+        empty_cache = None
+    if empty_cache is not None:
+        empty_cache()
+    gc.collect()
+
+
+def allocate_memory_chunks(target_bytes, device, dt):
+    element_size = get_dtype_size(dt)
+    target_elements = max(1, target_bytes // element_size)
+    max_chunk_elements = max(1, MAX_MEMORY_CHUNK_BYTES // element_size)
+    chunks = []
+    allocated_elements = 0
+
+    while allocated_elements < target_elements:
+        chunk_elements = min(max_chunk_elements, target_elements - allocated_elements)
+        chunks.append(torch.empty((chunk_elements,), device=device, dtype=dt))
+        allocated_elements += chunk_elements
+
+    return chunks, allocated_elements * element_size
+
+
+def touch_memory_chunks(chunks, allocated_bytes, iterations, device):
+    times = []
+    for i in tqdm(range(iterations), desc=f"memory on {device}", leave=False):
+        start = time.perf_counter()
+        for chunk in chunks:
+            chunk.fill_(float((i % 7) + 1))
+            chunk.sum()
+        sync(device)
+        times.append(time.perf_counter() - start)
+
+    total_time = sum(times)
+    touched_bytes = allocated_bytes * 2 * iterations
+    bandwidth_gib_s = bytes_to_gib(touched_bytes) / total_time if total_time else 0.0
+    return times, bandwidth_gib_s
+
+
+def release_memory_chunks(chunks, device):
+    chunks.clear()
+    clear_device_cache(device)
+
+
+def format_memory_stats(stats):
+    return ", ".join(f"{name}={bytes_to_mb(value):.1f} MB" for name, value in stats.items())
+
+
+def run_memory_stress(device, dt, iterations, memory_percent, memory_mb, logger):
+    chunks = []
+    try:
+        target_bytes, available_bytes, total_bytes, source = calculate_memory_target_bytes(
+            device,
+            memory_percent,
+            memory_mb,
+        )
+        logger.info(
+            f"[{device}] memory target={bytes_to_mb(target_bytes):.1f} MB "
+            f"(source={source})"
+        )
+        if available_bytes is not None:
+            total_text = "unknown" if total_bytes is None else f"{bytes_to_mb(total_bytes):.1f} MB"
+            logger.info(
+                f"[{device}] memory available={bytes_to_mb(available_bytes):.1f} MB, "
+                f"total={total_text}"
+            )
+
+        reset_peak_memory_stats(device)
+        chunks, allocated_bytes = allocate_memory_chunks(target_bytes, device, dt)
+        times, bandwidth_gib_s = touch_memory_chunks(
+            chunks,
+            allocated_bytes,
+            iterations,
+            device,
+        )
+        logger.info(
+            f"[{device}] memory: allocated={bytes_to_mb(allocated_bytes):.1f} MB, "
+            f"avg_touch={statistics.mean(times):.6f}s, bandwidth={bandwidth_gib_s:.3f} GiB/s"
+        )
+        stats = get_memory_stats(device)
+        if stats:
+            logger.info(f"[{device}] memory stats: {format_memory_stats(stats)}")
+    except (RuntimeError, MemoryError, TypeError) as exc:
+        logger.warning(f"[{device}] Memory stress failed: {exc}")
+    finally:
+        release_memory_chunks(chunks, device)
 
 
 @click.command()
@@ -206,8 +409,21 @@ def run_operations(ops, device, iterations, logger, skip_failed_ops=False):
     "--suite",
     default="basic",
     show_default=True,
-    type=click.Choice(["basic", "extended", "all"]),
+    type=click.Choice(["basic", "extended", "all", "memory", "full"]),
     help="Benchmark suite to run.",
+)
+@click.option(
+    "--memory-percent",
+    default=70.0,
+    show_default=True,
+    type=click.FloatRange(min=1.0, max=95.0),
+    help="Percent of detected available memory to stress.",
+)
+@click.option(
+    "--memory-mb",
+    default=None,
+    type=click.IntRange(min=1),
+    help="Exact memory stress target in MB; overrides --memory-percent.",
 )
 @click.option(
     "--seed", default=42, show_default=True,
@@ -217,7 +433,16 @@ def run_operations(ops, device, iterations, logger, skip_failed_ops=False):
     "--verbose", is_flag=True,
     help="Enable DEBUG logging.",
 )
-def main(iterations: int, size: int, dtype: str, suite: str, seed: int, verbose: bool):
+def main(
+    iterations: int,
+    size: int,
+    dtype: str,
+    suite: str,
+    memory_percent: float,
+    memory_mb: int | None,
+    seed: int,
+    verbose: bool,
+):
     """
     Benchmark common PyTorch operations across available devices.
     """
@@ -235,32 +460,43 @@ def main(iterations: int, size: int, dtype: str, suite: str, seed: int, verbose:
     dt = dtype_map[dtype]
 
     for device in devices:
-        skip_reason = get_skip_reason(device, dt)
-        if skip_reason:
-            logger.warning(skip_reason)
-            continue
-
         logger.info(f"\nBenchmarking on device: {device}")
-        if suite in ("basic", "all"):
-            run_operations(
-                build_basic_ops(size, device, dt),
+
+        if suite in COMPUTE_SUITES:
+            skip_reason = get_skip_reason(device, dt)
+            if skip_reason:
+                logger.warning(skip_reason)
+            else:
+                if suite in ("basic", "all", "full"):
+                    run_operations(
+                        build_basic_ops(size, device, dt),
+                        device,
+                        iterations,
+                        logger,
+                    )
+                if suite in ("extended", "all", "full"):
+                    try:
+                        extended_ops = build_extended_ops(size, device, dt)
+                    except Exception as exc:
+                        logger.warning(f"[{device}] Skipping extended suite: {exc}")
+                    else:
+                        run_operations(
+                            extended_ops,
+                            device,
+                            iterations,
+                            logger,
+                            skip_failed_ops=True,
+                        )
+
+        if suite in MEMORY_SUITES:
+            run_memory_stress(
                 device,
+                dt,
                 iterations,
+                memory_percent,
+                memory_mb,
                 logger,
             )
-        if suite in ("extended", "all"):
-            try:
-                extended_ops = build_extended_ops(size, device, dt)
-            except Exception as exc:
-                logger.warning(f"[{device}] Skipping extended suite: {exc}")
-            else:
-                run_operations(
-                    extended_ops,
-                    device,
-                    iterations,
-                    logger,
-                    skip_failed_ops=True,
-                )
 
 
 if __name__ == "__main__":

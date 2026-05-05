@@ -23,9 +23,26 @@ Run every available operation with a custom matrix size and iteration count:
 python pybench/pytorch_bench.py --suite all --size 2048 --iterations 50
 ```
 
+Stress RAM/VRAM only, using 25% of detected available memory:
+
+```bash
+python pybench/pytorch_bench.py --suite memory --memory-percent 25 --iterations 3
+```
+
+Run compute and memory stress together, with an exact memory target per device:
+
+```bash
+python pybench/pytorch_bench.py --suite full --memory-mb 4096 --iterations 5
+```
+
 Useful options:
 
-- `--suite basic|extended|all`: choose the benchmark suite.
+- `--suite basic|extended|all|memory|full`: choose the benchmark suite.
 - `--iterations N`: number of timed iterations per operation.
 - `--size N`: square matrix/vector size for tensor operations.
 - `--dtype float|double|half`: tensor dtype where supported by the device.
+- `--memory-percent N`: percent of detected available RAM/VRAM to stress.
+- `--memory-mb N`: exact memory stress target in MB per device.
+
+Memory stress intentionally applies RAM/VRAM pressure. It runs only for the
+`memory` and `full` suites, and devices are stressed sequentially.

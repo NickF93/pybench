@@ -1776,6 +1776,23 @@ class NvmlTelemetryBackend:
                 return None
             return fn(handle, *args)
 
+        def call_first_supported(*names):
+            last_exc = None
+            for name in names:
+                fn = getattr(nvml, name, None)
+                if not callable(fn):
+                    continue
+                try:
+                    value = fn(handle)
+                except Exception as exc:
+                    last_exc = exc
+                    continue
+                if value is not None:
+                    return value
+            if last_exc is not None:
+                raise last_exc
+            return None
+
         temperature_const = getattr(nvml, "NVML_TEMPERATURE_GPU", 0)
         sm_clock_const = getattr(nvml, "NVML_CLOCK_SM", 0)
         memory_clock_const = getattr(nvml, "NVML_CLOCK_MEM", 0)
@@ -1786,9 +1803,10 @@ class NvmlTelemetryBackend:
         utilization = call("nvmlDeviceGetUtilizationRates")
         sm_clock_mhz = call("nvmlDeviceGetClockInfo", sm_clock_const)
         memory_clock_mhz = call("nvmlDeviceGetClockInfo", memory_clock_const)
-        throttle_bits = call("nvmlDeviceGetCurrentClocksEventReasons")
-        if throttle_bits is None:
-            throttle_bits = call("nvmlDeviceGetCurrentClocksThrottleReasons")
+        throttle_bits = call_first_supported(
+            "nvmlDeviceGetCurrentClocksEventReasons",
+            "nvmlDeviceGetCurrentClocksThrottleReasons",
+        )
 
         return {
             "temperature_c": float(temperature_c)

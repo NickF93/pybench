@@ -173,6 +173,8 @@ class FakeNvml(types.ModuleType):
         self.throttle_bits = throttle_bits
         self.shutdown_calls = 0
         self.pci_bus_ids = []
+        self.event_reason_calls = 0
+        self.throttle_reason_calls = 0
 
     def nvmlInit(self):
         return None
@@ -203,9 +205,11 @@ class FakeNvml(types.ModuleType):
         return 2100 if clock_type == self.NVML_CLOCK_SM else 9000
 
     def nvmlDeviceGetCurrentClocksThrottleReasons(self, handle):
+        self.throttle_reason_calls += 1
         return self.throttle_bits
 
     def nvmlDeviceGetCurrentClocksEventReasons(self, handle):
+        self.event_reason_calls += 1
         return self.throttle_bits
 
 
@@ -631,6 +635,43 @@ class PyTorchBenchTests(unittest.TestCase):
         )
 
         self.assertEqual(reasons, ("gpu_idle", "sw_power_cap", "unknown_0x200"))
+
+    def test_nvml_backend_falls_back_when_event_reason_api_is_absent(self):
+        class OldNvml(FakeNvml):
+            nvmlDeviceGetCurrentClocksEventReasons = None
+
+        fake_torch = make_fake_torch()
+        fake_torch.cuda = FakeCuda(available=True, count=1)
+        module, fake_torch = load_bench_module(fake_torch)
+        fake_nvml = OldNvml(
+            throttle_bits=FakeNvml.NVML_CLOCK_THROTTLE_REASON_SW_POWER_CAP,
+        )
+        backend = module.NvmlTelemetryBackend(fake_nvml)
+
+        sample = backend.sample(fake_torch.device("cuda:0"))
+
+        self.assertEqual(sample["throttle_reasons"], ("sw_power_cap",))
+        self.assertEqual(fake_nvml.throttle_reason_calls, 1)
+
+    def test_nvml_backend_falls_back_when_event_reason_api_fails(self):
+        class EventFailingNvml(FakeNvml):
+            def nvmlDeviceGetCurrentClocksEventReasons(self, handle):
+                self.event_reason_calls += 1
+                raise RuntimeError("event reasons unavailable")
+
+        fake_torch = make_fake_torch()
+        fake_torch.cuda = FakeCuda(available=True, count=1)
+        module, fake_torch = load_bench_module(fake_torch)
+        fake_nvml = EventFailingNvml(
+            throttle_bits=FakeNvml.NVML_CLOCK_THROTTLE_REASON_SW_POWER_CAP,
+        )
+        backend = module.NvmlTelemetryBackend(fake_nvml)
+
+        sample = backend.sample(fake_torch.device("cuda:0"))
+
+        self.assertEqual(sample["throttle_reasons"], ("sw_power_cap",))
+        self.assertEqual(fake_nvml.event_reason_calls, 1)
+        self.assertEqual(fake_nvml.throttle_reason_calls, 1)
 
     def test_sw_power_cap_telemetry_is_recorded_without_health_warning(self):
         module, fake_torch = load_bench_module()

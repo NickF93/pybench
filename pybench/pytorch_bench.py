@@ -45,6 +45,7 @@ BENCHMARK_BASELINES = {
     "memory_read": 20.0,
 }
 DEFAULT_TELEMETRY_INTERVAL = 5.0
+DEFAULT_PROGRESS_INTERVAL = 60.0
 DEFAULT_MAX_TEMP_C = 90.0
 DEFAULT_CORRECTNESS_INTERVAL = 10
 GPU_HEALTH_DEFAULT_DURATION = 600.0
@@ -787,10 +788,18 @@ def log_benchmark_result(logger, result):
     )
 
 
-def run_benchmark_tests(benchmark_tests, device, min_run_time, logger):
+def run_benchmark_tests(
+    benchmark_tests,
+    device,
+    min_run_time,
+    logger,
+    progress=True,
+):
     results = []
     for benchmark_test in benchmark_tests:
         try:
+            if progress:
+                logger.info(f"[{device}] benchmark {benchmark_test.name}: started")
             median_time, iqr_time = measure_benchmark_test(
                 benchmark_test,
                 device,
@@ -807,6 +816,8 @@ def run_benchmark_tests(benchmark_tests, device, min_run_time, logger):
             continue
 
         log_benchmark_result(logger, result)
+        if progress:
+            logger.info(f"[{device}] benchmark {benchmark_test.name}: finished")
         results.append(result)
     return results
 
@@ -972,6 +983,7 @@ def run_benchmark_mode(
     memory_mb,
     benchmark_min_time,
     logger,
+    progress=True,
 ):
     summaries = {}
     for device in devices:
@@ -988,6 +1000,7 @@ def run_benchmark_mode(
                 device,
                 benchmark_min_time,
                 logger,
+                progress=progress,
             )
         except Exception as exc:
             logger.warning(f"[{device}] Benchmark compute failed: {exc}")
@@ -1009,6 +1022,7 @@ def run_benchmark_mode(
                     device,
                     benchmark_min_time,
                     logger,
+                    progress=progress,
                 )
             except (RuntimeError, MemoryError, TypeError) as exc:
                 logger.warning(f"[{device}] Skipping benchmark memory: {exc}")
@@ -1049,6 +1063,80 @@ def log_operation_summary(logger, summary):
     )
 
 
+def format_duration(seconds):
+    if 0 < seconds < 1:
+        return "<1s"
+    seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+class ProgressReporter:
+    def __init__(
+        self,
+        logger,
+        enabled=True,
+        interval=DEFAULT_PROGRESS_INTERVAL,
+        clock=time.perf_counter,
+    ):
+        self.logger = logger
+        self.enabled = enabled
+        self.interval = max(float(interval), 1.0)
+        self.clock = clock
+        self.stage_name = None
+        self.total_seconds = None
+        self.started_at = None
+        self.next_log_at = None
+
+    def start(self, stage_name, total_seconds=None):
+        self.stage_name = stage_name
+        self.total_seconds = total_seconds
+        self.started_at = self.clock()
+        self.next_log_at = self.started_at + self.interval
+        if not self.enabled:
+            return
+        if total_seconds is None:
+            self.logger.info(f"{stage_name}: started")
+        else:
+            self.logger.info(
+                f"{stage_name}: started, expected={format_duration(total_seconds)}"
+            )
+
+    def maybe_log(self):
+        if not self.enabled or self.started_at is None:
+            return
+        now = self.clock()
+        if now < self.next_log_at:
+            return
+        while self.next_log_at <= now:
+            self.next_log_at += self.interval
+        elapsed = now - self.started_at
+        if self.total_seconds is None:
+            self.logger.info(
+                f"{self.stage_name}: elapsed={format_duration(elapsed)}"
+            )
+            return
+        remaining = max(self.total_seconds - elapsed, 0.0)
+        percent = min(100.0, (elapsed / self.total_seconds) * 100.0)
+        self.logger.info(
+            f"{self.stage_name}: elapsed={format_duration(elapsed)}, "
+            f"remaining={format_duration(remaining)}, progress={percent:.0f}%"
+        )
+
+    def finish(self):
+        if not self.enabled or self.started_at is None:
+            return
+        elapsed = self.clock() - self.started_at
+        self.logger.info(
+            f"{self.stage_name}: finished in {format_duration(elapsed)}"
+        )
+
+
 def benchmark_op(
     name,
     fn,
@@ -1058,6 +1146,7 @@ def benchmark_op(
     correctness="off",
     correctness_interval=DEFAULT_CORRECTNESS_INTERVAL,
     telemetry_monitor=None,
+    progress=True,
 ):
     with inference_context():
         for warmup_index in range(5):
@@ -1071,6 +1160,7 @@ def benchmark_op(
             range(iterations),
             desc=f"{name} on {device}",
             leave=False,
+            disable=not progress,
         ):
             start = time.perf_counter()
             result = fn()
@@ -1167,6 +1257,7 @@ def run_operations(
     correctness_interval=DEFAULT_CORRECTNESS_INTERVAL,
     telemetry_monitor=None,
     health=None,
+    progress=True,
 ):
     summaries = []
     for name, fn in ops:
@@ -1180,6 +1271,7 @@ def run_operations(
                 correctness=correctness,
                 correctness_interval=correctness_interval,
                 telemetry_monitor=telemetry_monitor,
+                progress=progress,
             )
         except Exception as exc:
             if health is not None:
@@ -1234,6 +1326,9 @@ def run_operations_for_duration(
     memory_context=None,
     memory_dt=None,
     memory_times=None,
+    duration=None,
+    progress=True,
+    progress_interval=DEFAULT_PROGRESS_INTERVAL,
 ):
     if not ops:
         return []
@@ -1250,6 +1345,13 @@ def run_operations_for_duration(
             skip_failed_ops=True,
         ) or ()
     )
+
+    progress_reporter = ProgressReporter(
+        logger,
+        enabled=progress,
+        interval=progress_interval,
+    )
+    progress_reporter.start(f"[{device}] duration stress", duration)
 
     with inference_context():
         while time.perf_counter() < deadline:
@@ -1279,6 +1381,7 @@ def run_operations_for_duration(
                 cycle_completed = True
                 if telemetry_monitor is not None:
                     telemetry_monitor.sample(device)
+                progress_reporter.maybe_log()
             if (
                 memory_context is not None
                 and memory_times is not None
@@ -1308,8 +1411,10 @@ def run_operations_for_duration(
                 else:
                     if telemetry_monitor is not None:
                         telemetry_monitor.sample(device)
+                    progress_reporter.maybe_log()
             if failed_ops and len(failed_ops) == len(ops):
                 break
+    progress_reporter.finish()
 
     summaries = []
     for name, _ in ops:
@@ -1775,9 +1880,15 @@ def touch_memory_chunks(
     correctness="off",
     correctness_interval=DEFAULT_CORRECTNESS_INTERVAL,
     telemetry_monitor=None,
+    progress=True,
 ):
     times = []
-    for i in tqdm(range(iterations), desc=f"memory on {device}", leave=False):
+    for i in tqdm(
+        range(iterations),
+        desc=f"memory on {device}",
+        leave=False,
+        disable=not progress,
+    ):
         times.append(
             touch_memory_chunks_once(
                 chunks,
@@ -1891,6 +2002,7 @@ def run_memory_stress(
     correctness="off",
     correctness_interval=DEFAULT_CORRECTNESS_INTERVAL,
     telemetry_monitor=None,
+    progress=True,
 ):
     context = None
     try:
@@ -1904,6 +2016,7 @@ def run_memory_stress(
             correctness=correctness,
             correctness_interval=correctness_interval,
             telemetry_monitor=telemetry_monitor,
+            progress=progress,
         )
         result = make_memory_stress_result(
             device,
@@ -1939,8 +2052,20 @@ def run_memory_context_until_deadline(
     correctness,
     correctness_interval,
     telemetry_monitor=None,
+    logger=None,
+    duration=None,
+    progress=True,
+    progress_interval=DEFAULT_PROGRESS_INTERVAL,
 ):
     times = []
+    progress_reporter = None
+    if logger is not None:
+        progress_reporter = ProgressReporter(
+            logger,
+            enabled=progress,
+            interval=progress_interval,
+        )
+        progress_reporter.start(f"[{context.device}] memory duration stress", duration)
     while time.perf_counter() < deadline:
         times.append(
             touch_memory_chunks_once(
@@ -1954,6 +2079,10 @@ def run_memory_context_until_deadline(
         )
         if telemetry_monitor is not None:
             telemetry_monitor.sample(context.device)
+        if progress_reporter is not None:
+            progress_reporter.maybe_log()
+    if progress_reporter is not None:
+        progress_reporter.finish()
     return times
 
 
@@ -2187,6 +2316,8 @@ def run_stress_for_device(
     logger,
     health,
     telemetry_monitor,
+    progress=True,
+    progress_interval=DEFAULT_PROGRESS_INTERVAL,
 ):
     logger.info(f"\nBenchmarking on device: {device}")
     deadline = time.perf_counter() + duration if duration is not None else None
@@ -2250,6 +2381,7 @@ def run_stress_for_device(
                         correctness_interval=correctness_interval,
                         telemetry_monitor=telemetry_monitor,
                         health=health,
+                        progress=progress,
                     )
                 except Exception as exc:
                     health.fail(device, f"compute stress failed: {exc}")
@@ -2267,6 +2399,9 @@ def run_stress_for_device(
                     memory_context=memory_context,
                     memory_dt=memory_dt,
                     memory_times=memory_times,
+                    duration=duration,
+                    progress=progress,
+                    progress_interval=progress_interval,
                 )
 
         if memory_enabled:
@@ -2277,6 +2412,7 @@ def run_stress_for_device(
                     memory_kwargs["correctness_interval"] = correctness_interval
                 if telemetry_monitor is not None and telemetry_monitor.enabled:
                     memory_kwargs["telemetry_monitor"] = telemetry_monitor
+                memory_kwargs["progress"] = progress
                 result = run_memory_stress(
                     device,
                     memory_dt,
@@ -2299,6 +2435,10 @@ def run_stress_for_device(
                                 correctness,
                                 correctness_interval,
                                 telemetry_monitor=telemetry_monitor,
+                                logger=logger,
+                                duration=duration,
+                                progress=progress,
+                                progress_interval=progress_interval,
                             )
                         )
                     except (RuntimeError, MemoryError, TypeError) as exc:
@@ -2442,6 +2582,19 @@ def run_stress_for_device(
     help="Write a machine-readable JSON report.",
 )
 @click.option(
+    "--progress/--no-progress",
+    default=True,
+    show_default=True,
+    help="Show low-overhead wall-clock progress logs.",
+)
+@click.option(
+    "--progress-interval",
+    default=DEFAULT_PROGRESS_INTERVAL,
+    show_default=True,
+    type=click.FloatRange(min=1.0),
+    help="Seconds between progress heartbeat logs.",
+)
+@click.option(
     "--verbose", is_flag=True,
     help="Enable DEBUG logging.",
 )
@@ -2466,6 +2619,8 @@ def main(
     correctness_interval: int = DEFAULT_CORRECTNESS_INTERVAL,
     duration: float | None = None,
     json_report: str | None = None,
+    progress: bool = True,
+    progress_interval: float = DEFAULT_PROGRESS_INTERVAL,
 ):
     """
     Benchmark common PyTorch operations across available devices.
@@ -2525,6 +2680,8 @@ def main(
         "max_temp_c": max_temp_c,
         "correctness": correctness,
         "correctness_interval": correctness_interval,
+        "progress": progress,
+        "progress_interval_s": progress_interval,
     }
 
     # Map dtype strings to torch dtypes
@@ -2541,6 +2698,7 @@ def main(
                 memory_mb,
                 benchmark_min_time,
                 logger,
+                progress=progress,
             )
             for bench_device, summary in summaries.items():
                 health.add_benchmark_summary(bench_device, summary)
@@ -2560,6 +2718,8 @@ def main(
                     logger,
                     health,
                     telemetry_monitor,
+                    progress=progress,
+                    progress_interval=progress_interval,
                 )
         telemetry_monitor.sample_all(force=True)
     finally:

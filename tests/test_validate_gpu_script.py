@@ -94,12 +94,23 @@ class ValidateGpuScriptTests(unittest.TestCase):
         result = self.run_script(["--device", "cuda:0", "--dry-run"])
 
         self.assertEqual(result.returncode, 0)
+        self.assertIn("Plan:", result.stdout)
+        self.assertIn("estimated timed stress   35m 0s", result.stdout)
         self.assertIn("--duration 300", result.stdout)
         self.assertIn("--duration 1800", result.stdout)
         self.assertIn("--correctness strict", result.stdout)
         self.assertIn("--correctness sampled", result.stdout)
         self.assertIn("--mode benchmark", result.stdout)
         self.assertIn("--benchmark-memory", result.stdout)
+        self.assertIn("--progress-interval 60", result.stdout)
+        self.assertIn("--progress", result.stdout)
+
+    def test_dry_run_passes_no_progress_to_all_stages(self):
+        result = self.run_script(["--device", "cuda:0", "--dry-run", "--no-progress"])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.count("--no-progress"), 3)
+        self.assertNotIn("[benchmark baseline] running; ETA unavailable", result.stdout)
 
     def test_default_run_invokes_smoke_soak_and_benchmark(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -117,15 +128,20 @@ class ValidateGpuScriptTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("[benchmark baseline] running; ETA unavailable", result.stdout)
             calls = self.read_pybench_invocations(fake_log)
             self.assertEqual(len(calls), 3)
             self.assertIn("--preset", calls[0])
             self.assertEqual(calls[0][calls[0].index("--correctness") + 1], "strict")
             self.assertEqual(calls[0][calls[0].index("--duration") + 1], "300")
+            self.assertIn("--progress", calls[0])
+            self.assertEqual(calls[0][calls[0].index("--progress-interval") + 1], "60")
             self.assertEqual(calls[1][calls[1].index("--correctness") + 1], "sampled")
             self.assertEqual(calls[1][calls[1].index("--duration") + 1], "1800")
+            self.assertIn("--progress", calls[1])
             self.assertIn("--mode", calls[2])
             self.assertIn("--benchmark-memory", calls[2])
+            self.assertIn("--progress", calls[2])
 
     def test_warn_status_fails_by_default(self):
         with tempfile.TemporaryDirectory() as temp_dir:

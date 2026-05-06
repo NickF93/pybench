@@ -91,6 +91,14 @@ defaults when needed:
 ./validate_gpu.sh --device cuda:0 --soak-duration 900 --memory-percent 70
 ```
 
+Progress logs are enabled by default and are wall-clock only: they do not add
+GPU polling, memory queries, or extra synchronizations. Disable them for quieter
+output:
+
+```bash
+./validate_gpu.sh --device cuda:0 --no-progress
+```
+
 Useful options:
 
 - `--mode stress|benchmark`: run the configurable stress tests or the fixed
@@ -108,6 +116,8 @@ Useful options:
 - `--telemetry`: collect PyTorch memory stats and NVIDIA/NVML telemetry when
   available.
 - `--telemetry-interval N`: seconds between telemetry samples.
+- `--progress/--no-progress`: enable or disable low-overhead progress logs.
+- `--progress-interval N`: seconds between progress heartbeat logs.
 - `--max-temp-c N`: fail the health summary if a GPU reaches this temperature.
 - `--correctness off|smoke|sampled|strict`: choose stress correctness checks.
 - `--correctness-interval N`: operation interval for sampled correctness checks.

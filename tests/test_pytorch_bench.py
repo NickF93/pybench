@@ -534,6 +534,28 @@ class PyTorchBenchTests(unittest.TestCase):
         self.assertEqual(args[4], 99)
         self.assertEqual(args[7], 2.0)
 
+    def test_progress_options_are_forwarded_to_stress_runner(self):
+        module, _ = load_bench_module()
+        runner = CliRunner()
+
+        with mock.patch.object(module, "run_stress_for_device") as run_stress:
+            result = runner.invoke(
+                module.main,
+                [
+                    "--duration",
+                    "2",
+                    "--size",
+                    "1",
+                    "--no-progress",
+                    "--progress-interval",
+                    "7",
+                ],
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertFalse(run_stress.call_args.kwargs["progress"])
+        self.assertEqual(run_stress.call_args.kwargs["progress_interval"], 7.0)
+
     def test_duration_is_rejected_in_benchmark_mode(self):
         module, _ = load_bench_module()
         runner = CliRunner()
@@ -987,6 +1009,38 @@ class PyTorchBenchTests(unittest.TestCase):
             "[cpu] Skipping benchmark bad: unsupported op"
         )
 
+    def test_run_benchmark_tests_logs_progress_around_measurement(self):
+        module, fake_torch = load_bench_module()
+        logger = types.SimpleNamespace(info=mock.Mock(), warning=mock.Mock())
+        device = fake_torch.device("cpu")
+        test = module.BenchmarkTest(
+            name="good",
+            category="compute",
+            fn=lambda: None,
+            work_units=4.0,
+            throughput_unit="ops/s",
+            baseline=2.0,
+        )
+
+        with mock.patch.object(
+            module,
+            "measure_benchmark_test",
+            return_value=(0.5, 0.1),
+        ) as measure:
+            results = module.run_benchmark_tests(
+                [test],
+                device,
+                min_run_time=0.25,
+                logger=logger,
+                progress=True,
+            )
+
+        self.assertEqual(len(results), 1)
+        measure.assert_called_once_with(test, device, 0.25)
+        messages = [call.args[0] for call in logger.info.call_args_list]
+        self.assertIn("[cpu] benchmark good: started", messages)
+        self.assertIn("[cpu] benchmark good: finished", messages)
+
     def test_run_benchmark_mode_runs_compute_by_default_without_memory(self):
         module, fake_torch = load_bench_module()
         logger = types.SimpleNamespace(info=mock.Mock(), warning=mock.Mock())
@@ -1042,6 +1096,7 @@ class PyTorchBenchTests(unittest.TestCase):
             device,
             0.25,
             logger,
+            progress=True,
         )
         self.assertAlmostEqual(summaries[device].final_score, 1000.0)
 
@@ -1301,6 +1356,54 @@ class PyTorchBenchTests(unittest.TestCase):
         messages = [call.args[0] for call in logger.info.call_args_list]
         self.assertTrue(any("memory: allocated=0.0 MB" in message for message in messages))
 
+    def test_no_progress_disables_tqdm_for_fixed_iteration_stress(self):
+        module, fake_torch = load_bench_module()
+        logger = types.SimpleNamespace(info=mock.Mock(), warning=mock.Mock())
+        device = fake_torch.device("cpu")
+
+        with (
+            mock.patch.object(module, "sync"),
+            mock.patch.object(
+                module,
+                "tqdm",
+                side_effect=lambda iterable, **kwargs: iterable,
+            ) as tqdm_mock,
+        ):
+            module.benchmark_op(
+                "op",
+                lambda: FakeTensor(),
+                device,
+                iterations=1,
+                logger=logger,
+                progress=False,
+            )
+
+        self.assertTrue(tqdm_mock.call_args.kwargs["disable"])
+
+    def test_progress_reporter_logs_time_only_heartbeat(self):
+        module, _ = load_bench_module()
+        logger = types.SimpleNamespace(info=mock.Mock(), warning=mock.Mock())
+        clock_values = iter([0.0, 30.0, 61.0, 90.0])
+        reporter = module.ProgressReporter(
+            logger,
+            enabled=True,
+            interval=60.0,
+            clock=lambda: next(clock_values),
+        )
+
+        reporter.start("[cpu] duration stress", total_seconds=120.0)
+        reporter.maybe_log()
+        reporter.maybe_log()
+        reporter.finish()
+
+        messages = [call.args[0] for call in logger.info.call_args_list]
+        self.assertIn("[cpu] duration stress: started, expected=2m 0s", messages)
+        self.assertIn(
+            "[cpu] duration stress: elapsed=1m 1s, remaining=59s, progress=51%",
+            messages,
+        )
+        self.assertIn("[cpu] duration stress: finished in 1m 30s", messages)
+
     def test_run_memory_stress_warns_and_cleans_up_on_failure(self):
         module, fake_torch = load_bench_module()
         logger = types.SimpleNamespace(info=mock.Mock(), warning=mock.Mock())
@@ -1431,6 +1534,7 @@ class PyTorchBenchTests(unittest.TestCase):
             70.0,
             None,
             logger,
+            progress=True,
         )
 
     def test_main_uses_float32_memory_stress_dtype_for_mps_float64(self):
@@ -1468,6 +1572,7 @@ class PyTorchBenchTests(unittest.TestCase):
             70.0,
             None,
             logger,
+            progress=True,
         )
 
     def test_main_benchmark_mode_uses_device_filter(self):
@@ -1507,6 +1612,7 @@ class PyTorchBenchTests(unittest.TestCase):
             None,
             0.25,
             logger,
+            progress=True,
         )
 
 

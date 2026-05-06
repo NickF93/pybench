@@ -75,6 +75,22 @@ Run a longer CUDA soak with explicit VRAM pressure:
 python pybench/pytorch_bench.py --device cuda --suite full --duration 3600 --memory-percent 80 --telemetry --correctness sampled
 ```
 
+Validate a specific CUDA GPU with the root helper script:
+
+```bash
+./validate_gpu.sh --device cuda:0
+```
+
+The helper runs a 5-minute strict smoke test, a 30-minute sampled soak test, and
+a benchmark baseline with memory subtests. Logs, JSON reports, and optional
+`nvidia-smi` snapshots are written under `reports/gpu-validation/`. It treats
+`WARN` as a failed validation unless `--allow-warn` is passed. Override the
+defaults when needed:
+
+```bash
+./validate_gpu.sh --device cuda:0 --soak-duration 900 --memory-percent 70
+```
+
 Useful options:
 
 - `--mode stress|benchmark`: run the configurable stress tests or the fixed

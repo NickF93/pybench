@@ -160,9 +160,12 @@ class FakeNvml(types.ModuleType):
     NVML_TEMPERATURE_GPU = 0
     NVML_CLOCK_SM = 1
     NVML_CLOCK_MEM = 2
-    NVML_CLOCK_THROTTLE_REASON_GPU_IDLE = 1
-    NVML_CLOCK_THROTTLE_REASON_SW_POWER_CAP = 2
-    NVML_CLOCK_THROTTLE_REASON_HW_THERMAL_SLOWDOWN = 4
+    nvmlClocksEventReasonGpuIdle = 0x1
+    nvmlClocksEventReasonSwPowerCap = 0x4
+    nvmlClocksEventReasonHwThermalSlowdown = 0x40
+    NVML_CLOCK_THROTTLE_REASON_GPU_IDLE = 0x1
+    NVML_CLOCK_THROTTLE_REASON_SW_POWER_CAP = 0x4
+    NVML_CLOCK_THROTTLE_REASON_HW_THERMAL_SLOWDOWN = 0x40
 
     def __init__(self, temperature=70, throttle_bits=0):
         super().__init__("pynvml")
@@ -200,6 +203,9 @@ class FakeNvml(types.ModuleType):
         return 2100 if clock_type == self.NVML_CLOCK_SM else 9000
 
     def nvmlDeviceGetCurrentClocksThrottleReasons(self, handle):
+        return self.throttle_bits
+
+    def nvmlDeviceGetCurrentClocksEventReasons(self, handle):
         return self.throttle_bits
 
 
@@ -615,6 +621,37 @@ class PyTorchBenchTests(unittest.TestCase):
         messages = [issue.message for issue in health.failures]
         self.assertIn("temperature exceeded limit 90.0C", messages)
         self.assertTrue(any("hard throttle" in message for message in messages))
+
+    def test_nvml_throttle_decode_uses_documented_fallback_bits(self):
+        module, _ = load_bench_module()
+
+        reasons = module.decode_nvml_throttle_reasons(
+            types.SimpleNamespace(),
+            0x1 | 0x4 | 0x200,
+        )
+
+        self.assertEqual(reasons, ("gpu_idle", "sw_power_cap", "unknown_0x200"))
+
+    def test_sw_power_cap_telemetry_is_recorded_without_health_warning(self):
+        module, fake_torch = load_bench_module()
+        device = fake_torch.device("cuda:0")
+        health = module.HealthReport(max_temp_c=90.0)
+
+        health.add_telemetry_sample(
+            module.TelemetrySample(
+                timestamp="now",
+                elapsed_s=1.0,
+                device=str(device),
+                source="nvml",
+                throttle_reasons=("gpu_idle", "sw_power_cap"),
+            )
+        )
+
+        self.assertEqual(health.status, module.HEALTH_PASS)
+        self.assertEqual(
+            health.telemetry_summary(device)["throttle_reasons"],
+            ["gpu_idle", "sw_power_cap"],
+        )
 
     def test_correctness_failure_exits_nonzero(self):
         fake_torch = make_fake_torch()

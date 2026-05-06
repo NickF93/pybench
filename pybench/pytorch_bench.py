@@ -63,7 +63,99 @@ HARD_THROTTLE_REASONS = frozenset(
         "sw_thermal_slowdown",
     }
 )
-IGNORED_THROTTLE_REASONS = frozenset({"gpu_idle"})
+IGNORED_THROTTLE_REASONS = frozenset({"gpu_idle", "sw_power_cap"})
+NVML_THROTTLE_REASON_MAP = (
+    (
+        "gpu_idle",
+        0x0000000000000001,
+        (
+            "nvmlClocksEventReasonGpuIdle",
+            "nvmlClocksThrottleReasonGpuIdle",
+            "NVML_CLOCKS_THROTTLE_REASON_GPU_IDLE",
+            "NVML_CLOCK_THROTTLE_REASON_GPU_IDLE",
+        ),
+    ),
+    (
+        "applications_clocks_setting",
+        0x0000000000000002,
+        (
+            "nvmlClocksEventReasonApplicationsClocksSetting",
+            "nvmlClocksThrottleReasonApplicationsClocksSetting",
+            "NVML_CLOCKS_THROTTLE_REASON_APPLICATIONS_CLOCKS_SETTING",
+            "NVML_CLOCK_THROTTLE_REASON_APPLICATIONS_CLOCKS_SETTING",
+        ),
+    ),
+    (
+        "sw_power_cap",
+        0x0000000000000004,
+        (
+            "nvmlClocksEventReasonSwPowerCap",
+            "nvmlClocksThrottleReasonSwPowerCap",
+            "NVML_CLOCKS_THROTTLE_REASON_SW_POWER_CAP",
+            "NVML_CLOCK_THROTTLE_REASON_SW_POWER_CAP",
+        ),
+    ),
+    (
+        "hw_slowdown",
+        0x0000000000000008,
+        (
+            "nvmlClocksEventReasonHwSlowdown",
+            "nvmlClocksThrottleReasonHwSlowdown",
+            "NVML_CLOCKS_THROTTLE_REASON_HW_SLOWDOWN",
+            "NVML_CLOCK_THROTTLE_REASON_HW_SLOWDOWN",
+        ),
+    ),
+    (
+        "sync_boost",
+        0x0000000000000010,
+        (
+            "nvmlClocksEventReasonSyncBoost",
+            "nvmlClocksThrottleReasonSyncBoost",
+            "NVML_CLOCKS_THROTTLE_REASON_SYNC_BOOST",
+            "NVML_CLOCK_THROTTLE_REASON_SYNC_BOOST",
+        ),
+    ),
+    (
+        "sw_thermal_slowdown",
+        0x0000000000000020,
+        (
+            "nvmlClocksEventReasonSwThermalSlowdown",
+            "nvmlClocksThrottleReasonSwThermalSlowdown",
+            "NVML_CLOCKS_THROTTLE_REASON_SW_THERMAL_SLOWDOWN",
+            "NVML_CLOCK_THROTTLE_REASON_SW_THERMAL_SLOWDOWN",
+        ),
+    ),
+    (
+        "hw_thermal_slowdown",
+        0x0000000000000040,
+        (
+            "nvmlClocksEventReasonHwThermalSlowdown",
+            "nvmlClocksThrottleReasonHwThermalSlowdown",
+            "NVML_CLOCKS_THROTTLE_REASON_HW_THERMAL_SLOWDOWN",
+            "NVML_CLOCK_THROTTLE_REASON_HW_THERMAL_SLOWDOWN",
+        ),
+    ),
+    (
+        "hw_power_brake_slowdown",
+        0x0000000000000080,
+        (
+            "nvmlClocksEventReasonHwPowerBrakeSlowdown",
+            "nvmlClocksThrottleReasonHwPowerBrakeSlowdown",
+            "NVML_CLOCKS_THROTTLE_REASON_HW_POWER_BRAKE_SLOWDOWN",
+            "NVML_CLOCK_THROTTLE_REASON_HW_POWER_BRAKE_SLOWDOWN",
+        ),
+    ),
+    (
+        "display_clock_setting",
+        0x0000000000000100,
+        (
+            "nvmlClocksEventReasonDisplayClockSetting",
+            "nvmlClocksThrottleReasonDisplayClockSetting",
+            "NVML_CLOCKS_THROTTLE_REASON_DISPLAY_CLOCK_SETTING",
+            "NVML_CLOCK_THROTTLE_REASON_DISPLAY_CLOCK_SETTING",
+        ),
+    ),
+)
 REQUIRED_TORCH_ATTRIBUTES = (
     "device",
     "manual_seed",
@@ -1605,25 +1697,20 @@ def get_cuda_pci_bus_id(device):
 def decode_nvml_throttle_reasons(nvml, reason_bits):
     if not reason_bits:
         return ()
-    reason_map = (
-        ("NVML_CLOCK_THROTTLE_REASON_GPU_IDLE", "gpu_idle"),
-        ("NVML_CLOCK_THROTTLE_REASON_APPLICATIONS_CLOCKS_SETTING", "applications_clocks_setting"),
-        ("NVML_CLOCK_THROTTLE_REASON_SW_POWER_CAP", "sw_power_cap"),
-        ("NVML_CLOCK_THROTTLE_REASON_HW_SLOWDOWN", "hw_slowdown"),
-        ("NVML_CLOCK_THROTTLE_REASON_HW_THERMAL_SLOWDOWN", "hw_thermal_slowdown"),
-        ("NVML_CLOCK_THROTTLE_REASON_HW_POWER_BRAKE_SLOWDOWN", "hw_power_brake_slowdown"),
-        ("NVML_CLOCK_THROTTLE_REASON_SYNC_BOOST", "sync_boost"),
-        ("NVML_CLOCK_THROTTLE_REASON_SW_THERMAL_SLOWDOWN", "sw_thermal_slowdown"),
-        ("NVML_CLOCK_THROTTLE_REASON_DISPLAY_CLOCK_SETTING", "display_clock_setting"),
-    )
     names = []
     known_bits = 0
-    for attr, name in reason_map:
-        value = getattr(nvml, attr, 0)
-        if value:
+    for name, fallback_value, attrs in NVML_THROTTLE_REASON_MAP:
+        values = {fallback_value}
+        values.update(
+            value
+            for attr in attrs
+            if isinstance((value := getattr(nvml, attr, 0)), int) and value
+        )
+        for value in values:
             known_bits |= value
             if reason_bits & value:
                 names.append(name)
+                break
     unknown_bits = reason_bits & ~known_bits
     if unknown_bits:
         names.append(f"unknown_0x{unknown_bits:x}")
@@ -1699,7 +1786,9 @@ class NvmlTelemetryBackend:
         utilization = call("nvmlDeviceGetUtilizationRates")
         sm_clock_mhz = call("nvmlDeviceGetClockInfo", sm_clock_const)
         memory_clock_mhz = call("nvmlDeviceGetClockInfo", memory_clock_const)
-        throttle_bits = call("nvmlDeviceGetCurrentClocksThrottleReasons")
+        throttle_bits = call("nvmlDeviceGetCurrentClocksEventReasons")
+        if throttle_bits is None:
+            throttle_bits = call("nvmlDeviceGetCurrentClocksThrottleReasons")
 
         return {
             "temperature_c": float(temperature_c)

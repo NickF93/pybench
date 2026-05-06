@@ -1,4 +1,5 @@
 import importlib
+import json
 import logging
 import sys
 import types
@@ -9,11 +10,13 @@ from click.testing import CliRunner
 
 
 class FakeTensor:
-    def __init__(self, name="tensor", elements=1, element_size=4):
+    def __init__(self, name="tensor", elements=1, element_size=4, scalar=None):
         self.name = name
         self.elements = elements
         self.element_size_value = element_size
         self.fill_values = []
+        self.scalar = scalar
+        self.sum_calls = 0
 
     def __matmul__(self, other):
         return FakeTensor("matmul")
@@ -24,8 +27,11 @@ class FakeTensor:
     def __mul__(self, other):
         return FakeTensor("mul")
 
-    def sum(self):
-        return FakeTensor("sum")
+    def sum(self, *args, **kwargs):
+        self.sum_calls += 1
+        if self.fill_values:
+            return FakeTensor("sum", scalar=self.elements * self.fill_values[-1])
+        return FakeTensor("sum", scalar=self.scalar)
 
     def t(self):
         return FakeTensor("transpose")
@@ -39,6 +45,23 @@ class FakeTensor:
 
     def element_size(self):
         return self.element_size_value
+
+    def item(self):
+        return 1.0 if self.scalar is None else self.scalar
+
+    def all(self):
+        return self
+
+
+class FakeFinite:
+    def __init__(self, value):
+        self.value = value
+
+    def all(self):
+        return self
+
+    def item(self):
+        return self.value
 
 
 class FakeDevice:
@@ -76,6 +99,7 @@ class FakeCuda:
             name=f"Fake GPU {idx}",
             total_memory=8 * 1024**3,
             multi_processor_count=80,
+            pci_bus_id=None,
         )
 
     def mem_get_info(self, device):
@@ -132,6 +156,53 @@ class FakeMpsBackend:
         return self.available
 
 
+class FakeNvml(types.ModuleType):
+    NVML_TEMPERATURE_GPU = 0
+    NVML_CLOCK_SM = 1
+    NVML_CLOCK_MEM = 2
+    NVML_CLOCK_THROTTLE_REASON_GPU_IDLE = 1
+    NVML_CLOCK_THROTTLE_REASON_SW_POWER_CAP = 2
+    NVML_CLOCK_THROTTLE_REASON_HW_THERMAL_SLOWDOWN = 4
+
+    def __init__(self, temperature=70, throttle_bits=0):
+        super().__init__("pynvml")
+        self.temperature = temperature
+        self.throttle_bits = throttle_bits
+        self.shutdown_calls = 0
+        self.pci_bus_ids = []
+
+    def nvmlInit(self):
+        return None
+
+    def nvmlShutdown(self):
+        self.shutdown_calls += 1
+
+    def nvmlDeviceGetHandleByIndex(self, index):
+        return f"handle-{index}"
+
+    def nvmlDeviceGetHandleByPciBusId(self, pci_bus_id):
+        self.pci_bus_ids.append(pci_bus_id)
+        return f"pci-handle-{pci_bus_id}"
+
+    def nvmlDeviceGetTemperature(self, handle, sensor):
+        return self.temperature
+
+    def nvmlDeviceGetPowerUsage(self, handle):
+        return 125000
+
+    def nvmlDeviceGetMemoryInfo(self, handle):
+        return types.SimpleNamespace(used=2 * 1024**3, total=8 * 1024**3)
+
+    def nvmlDeviceGetUtilizationRates(self, handle):
+        return types.SimpleNamespace(gpu=88, memory=42)
+
+    def nvmlDeviceGetClockInfo(self, handle, clock_type):
+        return 2100 if clock_type == self.NVML_CLOCK_SM else 9000
+
+    def nvmlDeviceGetCurrentClocksThrottleReasons(self, handle):
+        return self.throttle_bits
+
+
 class FakeModule:
     def __init__(self, *args, **kwargs):
         self.args = args
@@ -162,6 +233,7 @@ def make_fake_torch():
     fake_torch.rand = mock.Mock(side_effect=lambda *args, **kwargs: FakeTensor("rand"))
     fake_torch.dot = mock.Mock(return_value=FakeTensor("dot"))
     fake_torch.relu = mock.Mock(return_value=FakeTensor("relu"))
+    fake_torch.isfinite = mock.Mock(return_value=FakeFinite(True))
 
     def empty(shape, device=None, dtype=None):
         if shape == ():
@@ -392,6 +464,440 @@ class PyTorchBenchTests(unittest.TestCase):
         )
 
         self.assertEqual(mode_option.type.choices, module.MODE_CHOICES)
+
+    def test_cli_correctness_choices_match_constant(self):
+        module, _ = load_bench_module()
+        correctness_option = next(
+            param for param in module.main.params if "--correctness" in param.opts
+        )
+
+        self.assertEqual(correctness_option.type.choices, module.CORRECTNESS_CHOICES)
+
+    def test_gpu_health_preset_sets_defaults_and_preserves_overrides(self):
+        fake_torch = make_fake_torch()
+        fake_torch.cuda = FakeCuda(available=True, count=1)
+        module, _ = load_bench_module(fake_torch)
+        runner = CliRunner()
+
+        with mock.patch.object(module, "run_stress_for_device") as run_stress:
+            result = runner.invoke(
+                module.main,
+                [
+                    "--preset",
+                    "gpu-health",
+                    "--duration",
+                    "3",
+                ],
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        args = run_stress.call_args.args
+        self.assertEqual(str(args[0]), "cuda:0")
+        self.assertEqual(args[1], "full")
+        self.assertEqual(args[5], 80.0)
+        self.assertIsNone(args[6])
+        self.assertEqual(args[7], 3.0)
+        self.assertEqual(args[8], "sampled")
+        self.assertTrue(args[12].enabled)
+
+        run_stress.reset_mock()
+        with mock.patch.object(module, "run_stress_for_device", run_stress):
+            override_result = runner.invoke(
+                module.main,
+                [
+                    "--preset",
+                    "gpu-health",
+                    "--duration",
+                    "3",
+                    "--memory-mb",
+                    "64",
+                ],
+            )
+
+        self.assertEqual(override_result.exit_code, 0, override_result.output)
+        override_args = run_stress.call_args.args
+        self.assertEqual(override_args[5], 70.0)
+        self.assertEqual(override_args[6], 64)
+
+    def test_duration_is_forwarded_to_stress_runner(self):
+        module, _ = load_bench_module()
+        runner = CliRunner()
+
+        with mock.patch.object(module, "run_stress_for_device") as run_stress:
+            result = runner.invoke(
+                module.main,
+                ["--duration", "2", "--iterations", "99", "--size", "1"],
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        args = run_stress.call_args.args
+        self.assertEqual(args[4], 99)
+        self.assertEqual(args[7], 2.0)
+
+    def test_duration_is_rejected_in_benchmark_mode(self):
+        module, _ = load_bench_module()
+        runner = CliRunner()
+
+        result = runner.invoke(
+            module.main,
+            ["--mode", "benchmark", "--duration", "2"],
+        )
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("--duration is only supported in stress mode", result.output)
+
+    def test_json_report_writes_health_shape(self):
+        module, _ = load_bench_module()
+        runner = CliRunner()
+
+        with runner.isolated_filesystem():
+            with mock.patch.object(module, "run_stress_for_device"):
+                result = runner.invoke(
+                    module.main,
+                    ["--json-report", "report.json", "--iterations", "1", "--size", "1"],
+                )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            with open("report.json", encoding="utf-8") as report_file:
+                report = json.load(report_file)
+
+        self.assertEqual(report["schema_version"], module.JSON_REPORT_SCHEMA_VERSION)
+        self.assertEqual(report["status"], module.HEALTH_PASS)
+        self.assertEqual(report["config"]["mode"], "stress")
+        self.assertEqual(report["devices"][0]["name"], "cpu")
+
+    def test_telemetry_records_nvml_temperature_failure(self):
+        fake_torch = make_fake_torch()
+        fake_torch.cuda = FakeCuda(available=True, count=1)
+        module, fake_torch = load_bench_module(fake_torch)
+        logger = types.SimpleNamespace(info=mock.Mock(), warning=mock.Mock())
+        health = module.HealthReport(max_temp_c=90.0)
+        fake_nvml = FakeNvml(
+            temperature=95,
+            throttle_bits=FakeNvml.NVML_CLOCK_THROTTLE_REASON_HW_THERMAL_SLOWDOWN,
+        )
+
+        with mock.patch.dict(sys.modules, {"pynvml": fake_nvml}):
+            monitor = module.TelemetryMonitor(
+                True,
+                [fake_torch.device("cuda:0")],
+                1.0,
+                logger,
+                health,
+            )
+            monitor.sample(fake_torch.device("cuda:0"), force=True)
+            monitor.close()
+
+        self.assertEqual(health.status, module.HEALTH_FAIL)
+        self.assertEqual(fake_nvml.shutdown_calls, 1)
+        messages = [issue.message for issue in health.failures]
+        self.assertIn("temperature exceeded limit 90.0C", messages)
+        self.assertTrue(any("hard throttle" in message for message in messages))
+
+    def test_correctness_failure_exits_nonzero(self):
+        fake_torch = make_fake_torch()
+        fake_torch.isfinite = mock.Mock(return_value=FakeFinite(False))
+        module, _ = load_bench_module(fake_torch)
+        runner = CliRunner()
+
+        result = runner.invoke(
+            module.main,
+            ["--correctness", "smoke", "--iterations", "1", "--size", "1"],
+        )
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("Health check failed", result.output)
+
+    def test_memory_smoke_correctness_validates_first_touch_once(self):
+        module, fake_torch = load_bench_module()
+        device = fake_torch.device("cpu")
+        chunk = FakeTensor(elements=4)
+
+        with (
+            mock.patch.object(module, "sync"),
+            mock.patch.object(
+                module,
+                "validate_memory_sum",
+                wraps=module.validate_memory_sum,
+            ) as validate_memory_sum,
+        ):
+            module.touch_memory_chunks_once(
+                [chunk],
+                device,
+                fake_torch.float32,
+                iteration_index=0,
+                correctness="smoke",
+            )
+
+        self.assertEqual(chunk.sum_calls, 1)
+        validate_memory_sum.assert_called_once()
+        self.assertIn("observed_sum", validate_memory_sum.call_args.kwargs)
+
+    def test_memory_correctness_policy_covers_smoke_sampled_and_strict(self):
+        module, _ = load_bench_module()
+
+        self.assertTrue(module.should_validate_memory_iteration("smoke", 0, 10))
+        self.assertFalse(module.should_validate_memory_iteration("smoke", 1, 10))
+        self.assertTrue(module.should_validate_memory_iteration("sampled", 0, 10))
+        self.assertTrue(module.should_validate_memory_iteration("sampled", 10, 10))
+        self.assertFalse(module.should_validate_memory_iteration("sampled", 11, 10))
+        self.assertTrue(module.should_validate_memory_iteration("strict", 99, 10))
+
+    def test_duration_skips_failed_operation_after_first_failure(self):
+        module, fake_torch = load_bench_module()
+        logger = types.SimpleNamespace(info=mock.Mock(), warning=mock.Mock())
+        device = fake_torch.device("cpu")
+        health = module.HealthReport(max_temp_c=90.0)
+        bad_op = mock.Mock(side_effect=RuntimeError("boom"))
+        good_op = mock.Mock(return_value=FakeTensor())
+
+        with (
+            mock.patch.object(module, "warm_up_operations", return_value=set()),
+            mock.patch.object(module, "sync"),
+        ):
+            module.run_operations_for_duration(
+                [("bad", bad_op), ("good", good_op)],
+                device,
+                module.time.perf_counter() + 0.003,
+                logger,
+                health=health,
+            )
+
+        self.assertEqual(bad_op.call_count, 1)
+        self.assertGreater(good_op.call_count, 0)
+        self.assertEqual(health.status, module.HEALTH_FAIL)
+        self.assertTrue(
+            any("operation bad failed: boom" == issue.message for issue in health.failures)
+        )
+
+    def test_duration_skips_operation_that_fails_during_warmup(self):
+        module, fake_torch = load_bench_module()
+        logger = types.SimpleNamespace(info=mock.Mock(), warning=mock.Mock())
+        device = fake_torch.device("cpu")
+        health = module.HealthReport(max_temp_c=90.0)
+        bad_op = mock.Mock(side_effect=RuntimeError("warm boom"))
+        good_op = mock.Mock(return_value=FakeTensor())
+
+        with mock.patch.object(module, "sync"):
+            module.run_operations_for_duration(
+                [("bad", bad_op), ("good", good_op)],
+                device,
+                module.time.perf_counter() + 0.003,
+                logger,
+                health=health,
+            )
+
+        self.assertEqual(bad_op.call_count, 1)
+        self.assertGreater(good_op.call_count, 5)
+        self.assertTrue(
+            any(
+                "operation bad failed during warmup: warm boom" == issue.message
+                for issue in health.failures
+            )
+        )
+
+    def test_duration_memory_failure_marks_context_without_success_summary(self):
+        module, fake_torch = load_bench_module()
+        logger = types.SimpleNamespace(info=mock.Mock(), warning=mock.Mock())
+        device = fake_torch.device("cpu")
+        health = module.HealthReport(max_temp_c=90.0)
+        memory_context = module.MemoryStressContext(
+            device=device,
+            chunks=[FakeTensor()],
+            allocated_bytes=4,
+            available_bytes=8,
+            total_bytes=16,
+            source="test",
+        )
+        memory_times = []
+
+        with (
+            mock.patch.object(module, "warm_up_operations", return_value=set()),
+            mock.patch.object(module, "sync"),
+            mock.patch.object(
+                module,
+                "touch_memory_chunks_once",
+                side_effect=RuntimeError("bad memory"),
+            ) as touch_memory,
+        ):
+            module.run_operations_for_duration(
+                [("good", lambda: FakeTensor())],
+                device,
+                module.time.perf_counter() + 0.003,
+                logger,
+                health=health,
+                memory_context=memory_context,
+                memory_dt=fake_torch.float32,
+                memory_times=memory_times,
+            )
+
+        self.assertTrue(memory_context.failed)
+        self.assertEqual(touch_memory.call_count, 1)
+        summaries = health.memory_summaries[str(device)]
+        self.assertEqual(len(summaries), 1)
+        self.assertTrue(summaries[0].failed)
+        self.assertEqual(summaries[0].error, "bad memory")
+
+    def test_duration_full_builds_compute_before_memory_allocation(self):
+        module, fake_torch = load_bench_module()
+        logger = types.SimpleNamespace(info=mock.Mock(), warning=mock.Mock())
+        device = fake_torch.device("cpu")
+        health = module.HealthReport(max_temp_c=90.0)
+        order = []
+
+        def build_basic(*args, **kwargs):
+            order.append("basic")
+            return [("basic", lambda: FakeTensor())]
+
+        def build_extended(*args, **kwargs):
+            order.append("extended")
+            return []
+
+        def prepare_memory(*args, **kwargs):
+            order.append("memory")
+            return module.MemoryStressContext(
+                device=device,
+                chunks=[FakeTensor()],
+                allocated_bytes=4,
+                available_bytes=8,
+                total_bytes=16,
+                source="test",
+            )
+
+        with (
+            mock.patch.object(module, "build_basic_ops", side_effect=build_basic),
+            mock.patch.object(module, "build_extended_ops", side_effect=build_extended),
+            mock.patch.object(module, "prepare_memory_stress", side_effect=prepare_memory),
+            mock.patch.object(module, "run_operations_for_duration"),
+            mock.patch.object(
+                module,
+                "run_memory_context_until_deadline",
+                return_value=[0.1],
+            ),
+            mock.patch.object(module, "release_memory_chunks"),
+        ):
+            module.run_stress_for_device(
+                device,
+                suite="full",
+                size=1,
+                dt=fake_torch.float32,
+                iterations=1,
+                memory_percent=70.0,
+                memory_mb=None,
+                duration=1.0,
+                correctness="off",
+                correctness_interval=10,
+                logger=logger,
+                health=health,
+                telemetry_monitor=None,
+            )
+
+        self.assertEqual(order, ["basic", "extended", "memory"])
+
+    def test_telemetry_torch_memory_failures_warn_without_aborting_sample(self):
+        module, fake_torch = load_bench_module()
+        logger = types.SimpleNamespace(info=mock.Mock(), warning=mock.Mock())
+        device = fake_torch.device("cpu")
+        health = module.HealthReport(max_temp_c=90.0)
+        monitor = module.TelemetryMonitor(True, [device], 1.0, logger, health)
+
+        with (
+            mock.patch.object(
+                module,
+                "get_memory_stats",
+                side_effect=RuntimeError("stats unavailable"),
+            ),
+            mock.patch.object(
+                module,
+                "get_device_memory_info",
+                side_effect=RuntimeError("info unavailable"),
+            ),
+        ):
+            monitor.sample(device, force=True)
+
+        self.assertEqual(health.telemetry_summary(device)["sample_count"], 1)
+        warning_messages = [issue.message for issue in health.warnings]
+        self.assertIn("PyTorch memory stats unavailable: stats unavailable", warning_messages)
+        self.assertIn("PyTorch memory info unavailable: info unavailable", warning_messages)
+
+    def test_nvml_backend_prefers_pci_bus_id_handle_lookup(self):
+        fake_torch = make_fake_torch()
+        fake_torch.cuda = FakeCuda(available=True, count=1)
+        module, fake_torch = load_bench_module(fake_torch)
+        fake_torch.cuda.get_device_properties = mock.Mock(
+            return_value=types.SimpleNamespace(pci_bus_id="0000:01:00.0")
+        )
+        fake_nvml = FakeNvml()
+        backend = module.NvmlTelemetryBackend(fake_nvml)
+
+        handle = backend.get_handle(fake_torch.device("cuda:0"))
+
+        self.assertEqual(handle, "pci-handle-0000:01:00.0")
+        self.assertEqual(fake_nvml.pci_bus_ids, ["0000:01:00.0"])
+
+    def test_telemetry_summary_includes_utilization_memory_and_clocks(self):
+        module, fake_torch = load_bench_module()
+        device = fake_torch.device("cuda:0")
+        health = module.HealthReport(max_temp_c=90.0)
+
+        health.add_telemetry_sample(
+            module.TelemetrySample(
+                timestamp="now",
+                elapsed_s=1.0,
+                device=str(device),
+                source="nvml",
+                memory_used_mb=2048.0,
+                utilization_gpu_percent=88.0,
+                utilization_memory_percent=42.0,
+                sm_clock_mhz=2100.0,
+                memory_clock_mhz=9000.0,
+            )
+        )
+
+        summary = health.telemetry_summary(device)
+
+        self.assertEqual(summary["max_memory_used_mb"], 2048.0)
+        self.assertEqual(summary["max_gpu_utilization_percent"], 88.0)
+        self.assertEqual(summary["max_memory_utilization_percent"], 42.0)
+        self.assertEqual(summary["max_sm_clock_mhz"], 2100.0)
+        self.assertEqual(summary["max_memory_clock_mhz"], 9000.0)
+
+    def test_cli_memory_failure_exits_nonzero_and_writes_json_report(self):
+        module, _ = load_bench_module()
+        runner = CliRunner()
+        failed_result = module.MemoryStressResult(
+            device="cpu",
+            iterations=0,
+            allocated_bytes=0,
+            total_time=0.0,
+            avg_touch_time=0.0,
+            bandwidth_gib_s=0.0,
+            stats={},
+            failed=True,
+            error="bad memory",
+        )
+
+        with runner.isolated_filesystem():
+            with mock.patch.object(module, "run_memory_stress", return_value=failed_result):
+                result = runner.invoke(
+                    module.main,
+                    [
+                        "--suite",
+                        "memory",
+                        "--iterations",
+                        "1",
+                        "--json-report",
+                        "report.json",
+                    ],
+                )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("Health check failed", result.output)
+            with open("report.json", encoding="utf-8") as report_file:
+                report = json.load(report_file)
+
+        self.assertEqual(report["status"], module.HEALTH_FAIL)
+        self.assertEqual(report["issues"][0]["message"], "memory stress failed: bad memory")
 
     def test_geometric_mean_and_benchmark_summary_scores(self):
         module, fake_torch = load_bench_module()

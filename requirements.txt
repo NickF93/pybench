@@ -1,0 +1,5 @@
+torch>=2.0
+click>=8.0
+colorama>=0.4.6
+tqdm>=4.66
+nvidia-ml-py>=12.0

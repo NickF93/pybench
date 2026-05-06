@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import time
 import statistics
 import logging
@@ -9,10 +10,12 @@ import math
 import os
 from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from logging import StreamHandler, Formatter
-from typing import Callable
+from typing import Any, Callable
 
 import click
+from click.core import ParameterSource
 from colorama import Fore, Style, init as colorama_init
 from tqdm import tqdm
 import torch
@@ -23,6 +26,8 @@ EXTENDED_SUITE = ("dot", "transpose", "relu", "rand", "conv2d", "model_forward")
 MODE_CHOICES = ("stress", "benchmark")
 SUITE_CHOICES = ("basic", "extended", "all", "memory", "full")
 DTYPE_CHOICES = ("float", "double", "half")
+PRESET_CHOICES = ("gpu-health",)
+CORRECTNESS_CHOICES = ("off", "smoke", "sampled", "strict")
 COMPUTE_SUITES = ("basic", "extended", "all", "full")
 MEMORY_SUITES = ("memory", "full")
 MAX_MEMORY_CHUNK_BYTES = 256 * 1024**2
@@ -39,6 +44,25 @@ BENCHMARK_BASELINES = {
     "memory_fill": 20.0,
     "memory_read": 20.0,
 }
+DEFAULT_TELEMETRY_INTERVAL = 5.0
+DEFAULT_MAX_TEMP_C = 90.0
+DEFAULT_CORRECTNESS_INTERVAL = 10
+GPU_HEALTH_DEFAULT_DURATION = 600.0
+GPU_HEALTH_DEFAULT_MEMORY_PERCENT = 80.0
+JSON_REPORT_SCHEMA_VERSION = 1
+MAX_TELEMETRY_SAMPLES_PER_DEVICE = 2000
+HEALTH_PASS = "PASS"
+HEALTH_WARN = "WARN"
+HEALTH_FAIL = "FAIL"
+HARD_THROTTLE_REASONS = frozenset(
+    {
+        "hw_slowdown",
+        "hw_thermal_slowdown",
+        "hw_power_brake_slowdown",
+        "sw_thermal_slowdown",
+    }
+)
+IGNORED_THROTTLE_REASONS = frozenset({"gpu_idle"})
 REQUIRED_TORCH_ATTRIBUTES = (
     "device",
     "manual_seed",
@@ -81,6 +105,222 @@ class BenchmarkSummary:
     final_score: float | None
 
 
+@dataclass(frozen=True)
+class OperationSummary:
+    name: str
+    device: str
+    iterations: int
+    total_time: float
+    avg_time: float
+    min_time: float
+    max_time: float
+    std_time: float
+
+
+@dataclass(frozen=True)
+class MemoryStressResult:
+    device: str
+    iterations: int
+    allocated_bytes: int
+    total_time: float
+    avg_touch_time: float
+    bandwidth_gib_s: float
+    stats: dict[str, int]
+    failed: bool = False
+    error: str | None = None
+
+
+@dataclass
+class MemoryStressContext:
+    device: torch.device
+    chunks: list
+    allocated_bytes: int
+    available_bytes: int | None
+    total_bytes: int | None
+    source: str
+    failed: bool = False
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class HealthIssue:
+    severity: str
+    device: str | None
+    message: str
+
+
+@dataclass(frozen=True)
+class TelemetrySample:
+    timestamp: str
+    elapsed_s: float
+    device: str
+    source: str
+    temperature_c: float | None = None
+    power_w: float | None = None
+    memory_used_mb: float | None = None
+    memory_total_mb: float | None = None
+    utilization_gpu_percent: float | None = None
+    utilization_memory_percent: float | None = None
+    sm_clock_mhz: float | None = None
+    memory_clock_mhz: float | None = None
+    throttle_reasons: tuple[str, ...] = ()
+    torch_memory_mb: dict[str, float] | None = None
+    memory_available_mb: float | None = None
+    memory_info_source: str | None = None
+
+
+class HealthReport:
+    def __init__(self, max_temp_c: float):
+        self.max_temp_c = max_temp_c
+        self.issues: list[HealthIssue] = []
+        self.operation_summaries: dict[str, list[OperationSummary]] = {}
+        self.memory_summaries: dict[str, list[MemoryStressResult]] = {}
+        self.benchmark_summaries: dict[str, BenchmarkSummary] = {}
+        self.telemetry_samples: dict[str, list[TelemetrySample]] = {}
+        self.telemetry_dropped_samples: dict[str, int] = {}
+        self._issue_keys: set[tuple[str, str | None, str]] = set()
+
+    def warn(self, device: torch.device | str | None, message: str):
+        self._add_issue("warning", device, message)
+
+    def fail(self, device: torch.device | str | None, message: str):
+        self._add_issue("failure", device, message)
+
+    def _add_issue(self, severity: str, device: torch.device | str | None, message: str):
+        device_name = None if device is None else str(device)
+        key = (severity, device_name, message)
+        if key in self._issue_keys:
+            return
+        self._issue_keys.add(key)
+        self.issues.append(HealthIssue(severity, device_name, message))
+
+    def add_operation_summary(self, summary: OperationSummary):
+        self.operation_summaries.setdefault(summary.device, []).append(summary)
+
+    def add_memory_summary(self, summary: MemoryStressResult):
+        self.memory_summaries.setdefault(summary.device, []).append(summary)
+        if summary.failed is True:
+            self.fail(summary.device, f"memory stress failed: {summary.error}")
+
+    def add_benchmark_summary(self, device: torch.device, summary: BenchmarkSummary):
+        self.benchmark_summaries[str(device)] = summary
+        if summary.final_score is None:
+            self.warn(device, "benchmark produced no final score")
+
+    def add_telemetry_sample(self, sample: TelemetrySample):
+        samples = self.telemetry_samples.setdefault(sample.device, [])
+        if len(samples) < MAX_TELEMETRY_SAMPLES_PER_DEVICE:
+            samples.append(sample)
+        else:
+            self.telemetry_dropped_samples[sample.device] = (
+                self.telemetry_dropped_samples.get(sample.device, 0) + 1
+            )
+
+        if sample.temperature_c is not None and sample.temperature_c >= self.max_temp_c:
+            self.fail(
+                sample.device,
+                f"temperature exceeded limit {self.max_temp_c:.1f}C",
+            )
+
+        hard_reasons = [
+            reason
+            for reason in sample.throttle_reasons
+            if reason in HARD_THROTTLE_REASONS
+        ]
+        if hard_reasons:
+            self.fail(
+                sample.device,
+                f"NVML hard throttle detected: {', '.join(sorted(hard_reasons))}",
+            )
+            return
+
+        soft_reasons = [
+            reason
+            for reason in sample.throttle_reasons
+            if reason not in IGNORED_THROTTLE_REASONS
+        ]
+        if soft_reasons:
+            self.warn(
+                sample.device,
+                f"NVML throttle detected: {', '.join(sorted(soft_reasons))}",
+            )
+
+    @property
+    def failures(self):
+        return [issue for issue in self.issues if issue.severity == "failure"]
+
+    @property
+    def warnings(self):
+        return [issue for issue in self.issues if issue.severity == "warning"]
+
+    @property
+    def status(self):
+        if self.failures:
+            return HEALTH_FAIL
+        if self.warnings:
+            return HEALTH_WARN
+        return HEALTH_PASS
+
+    def device_status(self, device: torch.device | str):
+        device_name = str(device)
+        failures = [
+            issue
+            for issue in self.failures
+            if issue.device in (None, device_name)
+        ]
+        if failures:
+            return HEALTH_FAIL
+        warnings = [
+            issue
+            for issue in self.warnings
+            if issue.device in (None, device_name)
+        ]
+        if warnings:
+            return HEALTH_WARN
+        return HEALTH_PASS
+
+    def telemetry_summary(self, device: torch.device | str):
+        device_name = str(device)
+        samples = self.telemetry_samples.get(device_name, [])
+        if not samples:
+            return {
+                "sample_count": 0,
+                "dropped_samples": self.telemetry_dropped_samples.get(device_name, 0),
+            }
+
+        def max_present(attr):
+            values = [
+                getattr(sample, attr)
+                for sample in samples
+                if getattr(sample, attr) is not None
+            ]
+            return max(values) if values else None
+
+        throttle_reasons = sorted(
+            {
+                reason
+                for sample in samples
+                for reason in sample.throttle_reasons
+            }
+        )
+        return {
+            "sample_count": len(samples),
+            "dropped_samples": self.telemetry_dropped_samples.get(device_name, 0),
+            "max_temperature_c": max_present("temperature_c"),
+            "max_power_w": max_present("power_w"),
+            "max_memory_used_mb": max_present("memory_used_mb"),
+            "max_gpu_utilization_percent": max_present(
+                "utilization_gpu_percent"
+            ),
+            "max_memory_utilization_percent": max_present(
+                "utilization_memory_percent"
+            ),
+            "max_sm_clock_mhz": max_present("sm_clock_mhz"),
+            "max_memory_clock_mhz": max_present("memory_clock_mhz"),
+            "throttle_reasons": throttle_reasons,
+        }
+
+
 class ColoredFormatter(Formatter):
     """Logging Formatter to add colors."""
     FORMATS = {
@@ -119,6 +359,74 @@ def validate_torch_installation():
             "PyTorch installation "
             f"(missing required attributes: {', '.join(missing)})."
         )
+
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def option_source_is_default(name: str):
+    context = click.get_current_context(silent=True)
+    if context is None:
+        return True
+    get_parameter_source = getattr(context, "get_parameter_source", None)
+    if not callable(get_parameter_source):
+        return True
+    return get_parameter_source(name) == ParameterSource.DEFAULT
+
+
+def apply_preset_defaults(
+    preset,
+    mode,
+    suite,
+    device,
+    memory_percent,
+    memory_mb,
+    duration,
+    telemetry,
+    correctness,
+):
+    if preset is None:
+        return (
+            mode,
+            suite,
+            device,
+            memory_percent,
+            duration,
+            telemetry,
+            correctness,
+        )
+    if preset != "gpu-health":
+        raise click.ClickException(f"Unsupported preset: {preset}")
+
+    if option_source_is_default("mode"):
+        mode = "stress"
+    if option_source_is_default("suite"):
+        suite = "full"
+    if option_source_is_default("device"):
+        device = "cuda"
+    if (
+        option_source_is_default("memory_percent")
+        and option_source_is_default("memory_mb")
+        and memory_mb is None
+    ):
+        memory_percent = GPU_HEALTH_DEFAULT_MEMORY_PERCENT
+    if option_source_is_default("duration"):
+        duration = GPU_HEALTH_DEFAULT_DURATION
+    if option_source_is_default("telemetry"):
+        telemetry = True
+    if option_source_is_default("correctness"):
+        correctness = "sampled"
+
+    return mode, suite, device, memory_percent, duration, telemetry, correctness
+
+
+def safe_logger_error(logger, message):
+    error = getattr(logger, "error", None)
+    if callable(error):
+        error(message)
+    else:
+        logger.warning(message)
 
 
 def is_cuda_available():
@@ -302,6 +610,114 @@ def format_optional_score(score):
     if score is None:
         return "n/a"
     return f"{score:.1f}"
+
+
+def iter_tensor_results(value):
+    if value is None:
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from iter_tensor_results(item)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from iter_tensor_results(item)
+        return
+    numel = getattr(value, "numel", None)
+    element_size = getattr(value, "element_size", None)
+    if callable(numel) and callable(element_size):
+        yield value
+
+
+def tensor_is_finite(tensor):
+    isfinite = getattr(torch, "isfinite", None)
+    if not callable(isfinite):
+        return True
+    try:
+        finite = isfinite(tensor)
+    except (RuntimeError, TypeError):
+        return True
+    all_fn = getattr(finite, "all", None)
+    if callable(all_fn):
+        finite = all_fn()
+    item = getattr(finite, "item", None)
+    if callable(item):
+        return bool(item())
+    return bool(finite)
+
+
+def validate_result_is_finite(name, result, device):
+    checked = False
+    for tensor in iter_tensor_results(result):
+        checked = True
+        if not tensor_is_finite(tensor):
+            raise RuntimeError(f"{name} produced NaN or Inf on {device}")
+    return checked
+
+
+def should_validate_iteration(correctness, iteration_index, correctness_interval):
+    if correctness == "strict":
+        return True
+    if correctness == "sampled":
+        return iteration_index % correctness_interval == 0
+    return False
+
+
+def should_validate_warmup(correctness, warmup_index):
+    if correctness == "strict":
+        return True
+    return correctness in ("smoke", "sampled") and warmup_index == 0
+
+
+def should_validate_memory_iteration(correctness, iteration_index, correctness_interval):
+    return should_validate_iteration(
+        correctness,
+        iteration_index,
+        correctness_interval,
+    ) or should_validate_warmup(correctness, iteration_index)
+
+
+def scalar_to_float(value):
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return float(item())
+        except (RuntimeError, TypeError, ValueError):
+            return None
+    try:
+        return float(value)
+    except (RuntimeError, TypeError, ValueError):
+        return None
+
+
+def tensor_sum_for_validation(tensor, dt):
+    sum_fn = getattr(tensor, "sum", None)
+    if not callable(sum_fn):
+        return None
+    try:
+        if dt == torch.float16:
+            return sum_fn(dtype=torch.float32)
+        return sum_fn()
+    except TypeError:
+        return sum_fn()
+
+
+def validate_memory_sum(name, tensor, fill_value, dt, device, observed_sum=None):
+    value = (
+        observed_sum
+        if observed_sum is not None
+        else tensor_sum_for_validation(tensor, dt)
+    )
+    actual = scalar_to_float(value)
+    if actual is None:
+        return
+    expected = tensor.numel() * fill_value
+    tolerance = max(abs(expected) * 1e-3, 1e-2)
+    if not math.isfinite(actual) or abs(actual - expected) > tolerance:
+        raise RuntimeError(
+            f"{name} memory validation failed on {device}: "
+            f"expected {expected:.6g}, got {actual:.6g}"
+        )
 
 
 def measure_benchmark_test(benchmark_test, device, min_run_time):
@@ -607,31 +1023,88 @@ def run_benchmark_mode(
     return summaries
 
 
-def benchmark_op(name, fn, device, iterations, logger):
+def make_operation_summary(name, device, times):
+    total_time = sum(times)
+    avg_time = statistics.mean(times) if times else 0.0
+    min_time = min(times) if times else 0.0
+    max_time = max(times) if times else 0.0
+    std_time = statistics.stdev(times) if len(times) > 1 else 0.0
+    return OperationSummary(
+        name=name,
+        device=str(device),
+        iterations=len(times),
+        total_time=total_time,
+        avg_time=avg_time,
+        min_time=min_time,
+        max_time=max_time,
+        std_time=std_time,
+    )
+
+
+def log_operation_summary(logger, summary):
+    logger.info(
+        f"[{summary.device}] {summary.name}: total={summary.total_time:.6f}s, "
+        f"avg={summary.avg_time:.6f}s, min={summary.min_time:.6f}s, "
+        f"max={summary.max_time:.6f}s, std={summary.std_time:.6f}s"
+    )
+
+
+def benchmark_op(
+    name,
+    fn,
+    device,
+    iterations,
+    logger,
+    correctness="off",
+    correctness_interval=DEFAULT_CORRECTNESS_INTERVAL,
+    telemetry_monitor=None,
+):
     with inference_context():
-        # Warm-up
-        for _ in range(5):
-            fn()
+        for warmup_index in range(5):
+            result = fn()
+            if should_validate_warmup(correctness, warmup_index):
+                validate_result_is_finite(name, result, device)
         sync(device)
 
         times = []
-        for _ in tqdm(range(iterations), desc=f"{name} on {device}", leave=False):
+        for iteration_index in tqdm(
+            range(iterations),
+            desc=f"{name} on {device}",
+            leave=False,
+        ):
             start = time.perf_counter()
-            fn()
+            result = fn()
+            if should_validate_iteration(
+                correctness,
+                iteration_index,
+                correctness_interval,
+            ):
+                validate_result_is_finite(name, result, device)
             sync(device)
             end = time.perf_counter()
             times.append(end - start)
+            if telemetry_monitor is not None:
+                telemetry_monitor.sample(device)
 
-    total_time = sum(times)
-    avg_time = statistics.mean(times)
-    min_time = min(times)
-    max_time = max(times)
-    std_time = statistics.stdev(times) if len(times) > 1 else 0.0
+    summary = make_operation_summary(name, device, times)
+    log_operation_summary(logger, summary)
+    return summary
 
-    logger.info(
-        f"[{device}] {name}: total={total_time:.6f}s, avg={avg_time:.6f}s, "
-        f"min={min_time:.6f}s, max={max_time:.6f}s, std={std_time:.6f}s"
-    )
+
+def benchmark_op_once(
+    name,
+    fn,
+    device,
+    iteration_index,
+    correctness,
+    correctness_interval,
+):
+    start = time.perf_counter()
+    result = fn()
+    if should_validate_iteration(correctness, iteration_index, correctness_interval):
+        validate_result_is_finite(name, result, device)
+    sync(device)
+    return time.perf_counter() - start
 
 
 def build_basic_ops(size, device, dt):
@@ -684,14 +1157,168 @@ def get_operations(suite, size, device, dt):
     return ops
 
 
-def run_operations(ops, device, iterations, logger, skip_failed_ops=False):
+def run_operations(
+    ops,
+    device,
+    iterations,
+    logger,
+    skip_failed_ops=False,
+    correctness="off",
+    correctness_interval=DEFAULT_CORRECTNESS_INTERVAL,
+    telemetry_monitor=None,
+    health=None,
+):
+    summaries = []
     for name, fn in ops:
         try:
-            benchmark_op(name, fn, device, iterations, logger)
+            summary = benchmark_op(
+                name,
+                fn,
+                device,
+                iterations,
+                logger,
+                correctness=correctness,
+                correctness_interval=correctness_interval,
+                telemetry_monitor=telemetry_monitor,
+            )
         except Exception as exc:
+            if health is not None:
+                health.fail(device, f"operation {name} failed: {exc}")
             if not skip_failed_ops:
                 raise
             logger.warning(f"[{device}] Skipping {name}: {exc}")
+            continue
+        summaries.append(summary)
+        if health is not None:
+            health.add_operation_summary(summary)
+    return summaries
+
+
+def warm_up_operations(
+    ops,
+    device,
+    correctness,
+    health=None,
+    logger=None,
+    skip_failed_ops=False,
+):
+    failed_ops = set()
+    with inference_context():
+        for name, fn in ops:
+            try:
+                for warmup_index in range(5):
+                    result = fn()
+                    if should_validate_warmup(correctness, warmup_index):
+                        validate_result_is_finite(name, result, device)
+            except Exception as exc:
+                if health is not None:
+                    health.fail(device, f"operation {name} failed during warmup: {exc}")
+                if logger is not None:
+                    logger.warning(f"[{device}] Skipping {name}: {exc}")
+                if not skip_failed_ops:
+                    raise
+                failed_ops.add(name)
+        sync(device)
+    return failed_ops
+
+
+def run_operations_for_duration(
+    ops,
+    device,
+    deadline,
+    logger,
+    correctness="off",
+    correctness_interval=DEFAULT_CORRECTNESS_INTERVAL,
+    telemetry_monitor=None,
+    health=None,
+    memory_context=None,
+    memory_dt=None,
+    memory_times=None,
+):
+    if not ops:
+        return []
+
+    times_by_name = {name: [] for name, _ in ops}
+    iteration_by_name = {name: 0 for name, _ in ops}
+    failed_ops = set(
+        warm_up_operations(
+            ops,
+            device,
+            correctness,
+            health=health,
+            logger=logger,
+            skip_failed_ops=True,
+        ) or ()
+    )
+
+    with inference_context():
+        while time.perf_counter() < deadline:
+            cycle_completed = False
+            for name, fn in ops:
+                if time.perf_counter() >= deadline:
+                    break
+                if name in failed_ops:
+                    continue
+                try:
+                    elapsed = benchmark_op_once(
+                        name,
+                        fn,
+                        device,
+                        iteration_by_name[name],
+                        correctness,
+                        correctness_interval,
+                    )
+                except Exception as exc:
+                    failed_ops.add(name)
+                    if health is not None:
+                        health.fail(device, f"operation {name} failed: {exc}")
+                    logger.warning(f"[{device}] Skipping {name}: {exc}")
+                    continue
+                times_by_name[name].append(elapsed)
+                iteration_by_name[name] += 1
+                cycle_completed = True
+                if telemetry_monitor is not None:
+                    telemetry_monitor.sample(device)
+            if (
+                memory_context is not None
+                and memory_times is not None
+                and not memory_context.failed
+                and cycle_completed
+            ):
+                try:
+                    memory_iteration = len(memory_times)
+                    memory_times.append(
+                        touch_memory_chunks_once(
+                            memory_context.chunks,
+                            memory_context.device,
+                            memory_dt,
+                            memory_iteration,
+                            correctness,
+                            correctness_interval,
+                        )
+                    )
+                except (RuntimeError, MemoryError, TypeError) as exc:
+                    record_memory_context_failure(
+                        memory_context,
+                        memory_times,
+                        exc,
+                        logger,
+                        health,
+                    )
+                else:
+                    if telemetry_monitor is not None:
+                        telemetry_monitor.sample(device)
+            if failed_ops and len(failed_ops) == len(ops):
+                break
+
+    summaries = []
+    for name, _ in ops:
+        summary = make_operation_summary(name, device, times_by_name[name])
+        log_operation_summary(logger, summary)
+        summaries.append(summary)
+        if health is not None:
+            health.add_operation_summary(summary)
+    return summaries
 
 
 def get_cpu_memory_info():
@@ -825,6 +1452,249 @@ def get_memory_stats(device):
     return stats
 
 
+def safe_get_memory_stats(device, health=None):
+    try:
+        return get_memory_stats(device)
+    except (RuntimeError, TypeError, ValueError) as exc:
+        if health is not None:
+            health.warn(device, f"PyTorch memory stats unavailable: {exc}")
+        return {}
+
+
+def safe_get_device_memory_info(device, health=None):
+    try:
+        return get_device_memory_info(device)
+    except (RuntimeError, TypeError, ValueError, OSError) as exc:
+        if health is not None:
+            health.warn(device, f"PyTorch memory info unavailable: {exc}")
+        return None, None, "unavailable"
+
+
+def format_torch_memory_mb(stats):
+    return {name: bytes_to_mb(value) for name, value in stats.items()}
+
+
+def get_cuda_device_index(device):
+    spec = str(device)
+    if ":" not in spec:
+        current_device = getattr(getattr(torch, "cuda", None), "current_device", None)
+        return int(current_device()) if callable(current_device) else 0
+    return int(spec.split(":", 1)[1])
+
+
+def get_cuda_pci_bus_id(device):
+    cuda = getattr(torch, "cuda", None)
+    get_device_properties = getattr(cuda, "get_device_properties", None)
+    if not callable(get_device_properties):
+        return None
+    try:
+        props = get_device_properties(device)
+    except (RuntimeError, TypeError, ValueError):
+        return None
+    pci_bus_id = getattr(props, "pci_bus_id", None)
+    if not pci_bus_id:
+        return None
+    return str(pci_bus_id)
+
+
+def decode_nvml_throttle_reasons(nvml, reason_bits):
+    if not reason_bits:
+        return ()
+    reason_map = (
+        ("NVML_CLOCK_THROTTLE_REASON_GPU_IDLE", "gpu_idle"),
+        ("NVML_CLOCK_THROTTLE_REASON_APPLICATIONS_CLOCKS_SETTING", "applications_clocks_setting"),
+        ("NVML_CLOCK_THROTTLE_REASON_SW_POWER_CAP", "sw_power_cap"),
+        ("NVML_CLOCK_THROTTLE_REASON_HW_SLOWDOWN", "hw_slowdown"),
+        ("NVML_CLOCK_THROTTLE_REASON_HW_THERMAL_SLOWDOWN", "hw_thermal_slowdown"),
+        ("NVML_CLOCK_THROTTLE_REASON_HW_POWER_BRAKE_SLOWDOWN", "hw_power_brake_slowdown"),
+        ("NVML_CLOCK_THROTTLE_REASON_SYNC_BOOST", "sync_boost"),
+        ("NVML_CLOCK_THROTTLE_REASON_SW_THERMAL_SLOWDOWN", "sw_thermal_slowdown"),
+        ("NVML_CLOCK_THROTTLE_REASON_DISPLAY_CLOCK_SETTING", "display_clock_setting"),
+    )
+    names = []
+    known_bits = 0
+    for attr, name in reason_map:
+        value = getattr(nvml, attr, 0)
+        if value:
+            known_bits |= value
+            if reason_bits & value:
+                names.append(name)
+    unknown_bits = reason_bits & ~known_bits
+    if unknown_bits:
+        names.append(f"unknown_0x{unknown_bits:x}")
+    return tuple(names)
+
+
+class NvmlTelemetryBackend:
+    def __init__(self, nvml):
+        self.nvml = nvml
+        self.handles: dict[str, Any] = {}
+
+    @classmethod
+    def create(cls, logger, health):
+        try:
+            nvml = importlib.import_module("pynvml")
+        except ImportError:
+            health.warn(None, "NVML telemetry unavailable: install nvidia-ml-py")
+            return None
+        try:
+            nvml.nvmlInit()
+        except Exception as exc:
+            health.warn(None, f"NVML telemetry unavailable: {exc}")
+            return None
+        logger.info("NVML telemetry enabled")
+        return cls(nvml)
+
+    def close(self):
+        shutdown = getattr(self.nvml, "nvmlShutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown()
+            except Exception:
+                pass
+
+    def get_handle(self, device):
+        device_key = str(device)
+        if device_key in self.handles:
+            return self.handles[device_key]
+
+        pci_bus_id = get_cuda_pci_bus_id(device)
+        get_handle_by_pci = getattr(self.nvml, "nvmlDeviceGetHandleByPciBusId", None)
+        if pci_bus_id and callable(get_handle_by_pci):
+            try:
+                self.handles[device_key] = get_handle_by_pci(pci_bus_id)
+                return self.handles[device_key]
+            except TypeError:
+                self.handles[device_key] = get_handle_by_pci(pci_bus_id.encode("ascii"))
+                return self.handles[device_key]
+            except Exception:
+                pass
+
+        index = get_cuda_device_index(device)
+        self.handles[device_key] = self.nvml.nvmlDeviceGetHandleByIndex(index)
+        return self.handles[device_key]
+
+    def sample(self, device):
+        handle = self.get_handle(device)
+        nvml = self.nvml
+
+        def call(name, *args):
+            fn = getattr(nvml, name, None)
+            if not callable(fn):
+                return None
+            return fn(handle, *args)
+
+        temperature_const = getattr(nvml, "NVML_TEMPERATURE_GPU", 0)
+        sm_clock_const = getattr(nvml, "NVML_CLOCK_SM", 0)
+        memory_clock_const = getattr(nvml, "NVML_CLOCK_MEM", 0)
+
+        temperature_c = call("nvmlDeviceGetTemperature", temperature_const)
+        power_mw = call("nvmlDeviceGetPowerUsage")
+        memory_info = call("nvmlDeviceGetMemoryInfo")
+        utilization = call("nvmlDeviceGetUtilizationRates")
+        sm_clock_mhz = call("nvmlDeviceGetClockInfo", sm_clock_const)
+        memory_clock_mhz = call("nvmlDeviceGetClockInfo", memory_clock_const)
+        throttle_bits = call("nvmlDeviceGetCurrentClocksThrottleReasons")
+
+        return {
+            "temperature_c": float(temperature_c)
+            if temperature_c is not None
+            else None,
+            "power_w": float(power_mw) / 1000.0 if power_mw is not None else None,
+            "memory_used_mb": bytes_to_mb(memory_info.used)
+            if memory_info is not None and hasattr(memory_info, "used")
+            else None,
+            "memory_total_mb": bytes_to_mb(memory_info.total)
+            if memory_info is not None and hasattr(memory_info, "total")
+            else None,
+            "utilization_gpu_percent": float(utilization.gpu)
+            if utilization is not None and hasattr(utilization, "gpu")
+            else None,
+            "utilization_memory_percent": float(utilization.memory)
+            if utilization is not None and hasattr(utilization, "memory")
+            else None,
+            "sm_clock_mhz": float(sm_clock_mhz)
+            if sm_clock_mhz is not None
+            else None,
+            "memory_clock_mhz": float(memory_clock_mhz)
+            if memory_clock_mhz is not None
+            else None,
+            "throttle_reasons": decode_nvml_throttle_reasons(nvml, throttle_bits),
+        }
+
+
+class TelemetryMonitor:
+    def __init__(
+        self,
+        enabled,
+        devices,
+        interval_s,
+        logger,
+        health,
+    ):
+        self.enabled = enabled
+        self.devices = list(devices)
+        self.interval_s = interval_s
+        self.logger = logger
+        self.health = health
+        self.started_at = time.perf_counter()
+        self.last_sample_at: dict[str, float] = {}
+        self.nvml = None
+        if enabled and any(device.type == "cuda" for device in self.devices):
+            self.nvml = NvmlTelemetryBackend.create(logger, health)
+
+    def close(self):
+        if self.nvml is not None:
+            self.nvml.close()
+
+    def sample_all(self, force=False):
+        for device in self.devices:
+            self.sample(device, force=force)
+
+    def sample(self, device, force=False):
+        if not self.enabled:
+            return
+        now = time.perf_counter()
+        device_name = str(device)
+        last_sample_at = self.last_sample_at.get(device_name)
+        if (
+            not force
+            and last_sample_at is not None
+            and now - last_sample_at < self.interval_s
+        ):
+            return
+        self.last_sample_at[device_name] = now
+        self._sample_device(device, now)
+
+    def _sample_device(self, device, now):
+        torch_stats = safe_get_memory_stats(device, self.health)
+        available_bytes, total_bytes, source = safe_get_device_memory_info(
+            device,
+            self.health,
+        )
+        sample_data = {
+            "timestamp": utc_now_iso(),
+            "elapsed_s": now - self.started_at,
+            "device": str(device),
+            "source": "torch",
+            "torch_memory_mb": format_torch_memory_mb(torch_stats),
+            "memory_available_mb": bytes_to_mb(available_bytes)
+            if available_bytes is not None
+            else None,
+            "memory_total_mb": bytes_to_mb(total_bytes)
+            if total_bytes is not None
+            else None,
+            "memory_info_source": source,
+        }
+        if device.type == "cuda" and self.nvml is not None:
+            try:
+                sample_data.update(self.nvml.sample(device))
+                sample_data["source"] = "nvml"
+            except Exception as exc:
+                self.health.warn(device, f"NVML sample failed: {exc}")
+        self.health.add_telemetry_sample(TelemetrySample(**sample_data))
+
+
 def clear_device_cache(device):
     if device.type == "cuda":
         backend = getattr(torch, "cuda", None)
@@ -863,15 +1733,63 @@ def allocate_memory_chunks(target_bytes, device, dt):
     return chunks, sum(tensor_nbytes(chunk) for chunk in chunks)
 
 
-def touch_memory_chunks(chunks, allocated_bytes, iterations, device):
+def touch_memory_chunks_once(
+    chunks,
+    device,
+    dt,
+    iteration_index,
+    correctness="off",
+    correctness_interval=DEFAULT_CORRECTNESS_INTERVAL,
+):
+    fill_value = float((iteration_index % 7) + 1)
+    start = time.perf_counter()
+    should_validate = should_validate_memory_iteration(
+        correctness,
+        iteration_index,
+        correctness_interval,
+    )
+    for chunk in chunks:
+        chunk.fill_(fill_value)
+        if should_validate:
+            observed_sum = tensor_sum_for_validation(chunk, dt)
+            validate_memory_sum(
+                "memory",
+                chunk,
+                fill_value,
+                dt,
+                device,
+                observed_sum=observed_sum,
+            )
+        else:
+            chunk.sum()
+    sync(device)
+    return time.perf_counter() - start
+
+
+def touch_memory_chunks(
+    chunks,
+    allocated_bytes,
+    iterations,
+    device,
+    dt,
+    correctness="off",
+    correctness_interval=DEFAULT_CORRECTNESS_INTERVAL,
+    telemetry_monitor=None,
+):
     times = []
     for i in tqdm(range(iterations), desc=f"memory on {device}", leave=False):
-        start = time.perf_counter()
-        for chunk in chunks:
-            chunk.fill_(float((i % 7) + 1))
-            chunk.sum()
-        sync(device)
-        times.append(time.perf_counter() - start)
+        times.append(
+            touch_memory_chunks_once(
+                chunks,
+                device,
+                dt,
+                i,
+                correctness,
+                correctness_interval,
+            )
+        )
+        if telemetry_monitor is not None:
+            telemetry_monitor.sample(device)
 
     total_time = sum(times)
     touched_bytes = allocated_bytes * 2 * iterations
@@ -888,46 +1806,524 @@ def format_memory_stats(stats):
     return ", ".join(f"{name}={bytes_to_mb(value):.1f} MB" for name, value in stats.items())
 
 
-def run_memory_stress(device, dt, iterations, memory_percent, memory_mb, logger):
-    chunks = []
-    try:
-        target_bytes, available_bytes, total_bytes, source = calculate_memory_target_bytes(
-            device,
-            memory_percent,
-            memory_mb,
-        )
+def prepare_memory_stress(device, dt, memory_percent, memory_mb, logger):
+    target_bytes, available_bytes, total_bytes, source = calculate_memory_target_bytes(
+        device,
+        memory_percent,
+        memory_mb,
+    )
+    logger.info(
+        f"[{device}] memory target={bytes_to_mb(target_bytes):.1f} MB "
+        f"(source={source})"
+    )
+    if available_bytes is not None:
+        total_text = "unknown" if total_bytes is None else f"{bytes_to_mb(total_bytes):.1f} MB"
         logger.info(
-            f"[{device}] memory target={bytes_to_mb(target_bytes):.1f} MB "
-            f"(source={source})"
+            f"[{device}] memory available={bytes_to_mb(available_bytes):.1f} MB, "
+            f"total={total_text}"
         )
-        if available_bytes is not None:
-            total_text = (
-                "unknown" if total_bytes is None else f"{bytes_to_mb(total_bytes):.1f} MB"
-            )
-            logger.info(
-                f"[{device}] memory available={bytes_to_mb(available_bytes):.1f} MB, "
-                f"total={total_text}"
-            )
 
-        reset_peak_memory_stats(device)
-        chunks, allocated_bytes = allocate_memory_chunks(target_bytes, device, dt)
-        times, bandwidth_gib_s = touch_memory_chunks(
-            chunks,
-            allocated_bytes,
+    reset_peak_memory_stats(device)
+    chunks, allocated_bytes = allocate_memory_chunks(target_bytes, device, dt)
+    return MemoryStressContext(
+        device=device,
+        chunks=chunks,
+        allocated_bytes=allocated_bytes,
+        available_bytes=available_bytes,
+        total_bytes=total_bytes,
+        source=source,
+    )
+
+
+def make_memory_stress_result(device, allocated_bytes, times, stats, failed=False, error=None):
+    total_time = sum(times)
+    touched_bytes = allocated_bytes * 2 * len(times)
+    bandwidth_gib_s = bytes_to_gib(touched_bytes) / total_time if total_time else 0.0
+    return MemoryStressResult(
+        device=str(device),
+        iterations=len(times),
+        allocated_bytes=allocated_bytes,
+        total_time=total_time,
+        avg_touch_time=statistics.mean(times) if times else 0.0,
+        bandwidth_gib_s=bandwidth_gib_s,
+        stats=stats,
+        failed=failed,
+        error=error,
+    )
+
+
+def record_memory_context_failure(context, times, error, logger, health=None):
+    context.failed = True
+    context.error = str(error)
+    result = make_memory_stress_result(
+        context.device,
+        context.allocated_bytes,
+        times,
+        safe_get_memory_stats(context.device, health),
+        failed=True,
+        error=context.error,
+    )
+    log_memory_stress_result(logger, result)
+    if health is not None:
+        health.add_memory_summary(result)
+    return result
+
+
+def log_memory_stress_result(logger, result):
+    if result.failed:
+        logger.warning(f"[{result.device}] Memory stress failed: {result.error}")
+        return
+    logger.info(
+        f"[{result.device}] memory: allocated={bytes_to_mb(result.allocated_bytes):.1f} MB, "
+        f"avg_touch={result.avg_touch_time:.6f}s, bandwidth={result.bandwidth_gib_s:.3f} GiB/s"
+    )
+    if result.stats:
+        logger.info(f"[{result.device}] memory stats: {format_memory_stats(result.stats)}")
+
+
+def run_memory_stress(
+    device,
+    dt,
+    iterations,
+    memory_percent,
+    memory_mb,
+    logger,
+    correctness="off",
+    correctness_interval=DEFAULT_CORRECTNESS_INTERVAL,
+    telemetry_monitor=None,
+):
+    context = None
+    try:
+        context = prepare_memory_stress(device, dt, memory_percent, memory_mb, logger)
+        times, _ = touch_memory_chunks(
+            context.chunks,
+            context.allocated_bytes,
             iterations,
             device,
+            dt,
+            correctness=correctness,
+            correctness_interval=correctness_interval,
+            telemetry_monitor=telemetry_monitor,
         )
-        logger.info(
-            f"[{device}] memory: allocated={bytes_to_mb(allocated_bytes):.1f} MB, "
-            f"avg_touch={statistics.mean(times):.6f}s, bandwidth={bandwidth_gib_s:.3f} GiB/s"
+        result = make_memory_stress_result(
+            device,
+            context.allocated_bytes,
+            times,
+            safe_get_memory_stats(device),
         )
-        stats = get_memory_stats(device)
-        if stats:
-            logger.info(f"[{device}] memory stats: {format_memory_stats(stats)}")
+        log_memory_stress_result(logger, result)
+        return result
     except (RuntimeError, MemoryError, TypeError) as exc:
-        logger.warning(f"[{device}] Memory stress failed: {exc}")
+        allocated_bytes = context.allocated_bytes if context is not None else 0
+        result = make_memory_stress_result(
+            device,
+            allocated_bytes,
+            [],
+            safe_get_memory_stats(device),
+            failed=True,
+            error=str(exc),
+        )
+        log_memory_stress_result(logger, result)
+        if context is None:
+            clear_device_cache(device)
+        return result
     finally:
-        release_memory_chunks(chunks, device)
+        if context is not None:
+            release_memory_chunks(context.chunks, device)
+
+
+def run_memory_context_until_deadline(
+    context,
+    deadline,
+    dt,
+    correctness,
+    correctness_interval,
+    telemetry_monitor=None,
+):
+    times = []
+    while time.perf_counter() < deadline:
+        times.append(
+            touch_memory_chunks_once(
+                context.chunks,
+                context.device,
+                dt,
+                len(times),
+                correctness,
+                correctness_interval,
+            )
+        )
+        if telemetry_monitor is not None:
+            telemetry_monitor.sample(context.device)
+    return times
+
+
+def build_environment_report():
+    report = {
+        "torch_version": getattr(torch, "__version__", "unknown"),
+        "cuda_available": is_cuda_available(),
+        "mps_available": is_mps_available(),
+    }
+    if is_cuda_available():
+        cuda_devices = []
+        cuda = getattr(torch, "cuda", None)
+        for idx in range(cuda.device_count()):
+            props = cuda.get_device_properties(idx)
+            cuda_devices.append(
+                {
+                    "index": idx,
+                    "name": getattr(props, "name", "unknown"),
+                    "total_memory_mb": bytes_to_mb(getattr(props, "total_memory", 0)),
+                    "multiprocessors": getattr(
+                        props,
+                        "multi_processor_count",
+                        None,
+                    ),
+                }
+            )
+        report["cuda_devices"] = cuda_devices
+    return report
+
+
+def operation_summary_to_dict(summary):
+    return {
+        "name": summary.name,
+        "device": summary.device,
+        "iterations": summary.iterations,
+        "total_time_s": summary.total_time,
+        "avg_time_s": summary.avg_time,
+        "min_time_s": summary.min_time,
+        "max_time_s": summary.max_time,
+        "std_time_s": summary.std_time,
+    }
+
+
+def memory_summary_to_dict(summary):
+    return {
+        "device": summary.device,
+        "iterations": summary.iterations,
+        "allocated_mb": bytes_to_mb(summary.allocated_bytes),
+        "total_time_s": summary.total_time,
+        "avg_touch_time_s": summary.avg_touch_time,
+        "bandwidth_gib_s": summary.bandwidth_gib_s,
+        "stats_mb": format_torch_memory_mb(summary.stats),
+        "failed": summary.failed,
+        "error": summary.error,
+    }
+
+
+def benchmark_summary_to_dict(summary):
+    return {
+        "compute_score": summary.compute_score,
+        "memory_score": summary.memory_score,
+        "final_score": summary.final_score,
+    }
+
+
+def telemetry_sample_to_dict(sample):
+    return {
+        "timestamp": sample.timestamp,
+        "elapsed_s": sample.elapsed_s,
+        "device": sample.device,
+        "source": sample.source,
+        "temperature_c": sample.temperature_c,
+        "power_w": sample.power_w,
+        "memory_used_mb": sample.memory_used_mb,
+        "memory_total_mb": sample.memory_total_mb,
+        "utilization_gpu_percent": sample.utilization_gpu_percent,
+        "utilization_memory_percent": sample.utilization_memory_percent,
+        "sm_clock_mhz": sample.sm_clock_mhz,
+        "memory_clock_mhz": sample.memory_clock_mhz,
+        "throttle_reasons": list(sample.throttle_reasons),
+        "torch_memory_mb": sample.torch_memory_mb or {},
+        "memory_available_mb": sample.memory_available_mb,
+        "memory_info_source": sample.memory_info_source,
+    }
+
+
+def build_json_report(
+    health,
+    config,
+    devices,
+    environment,
+    started_at,
+    finished_at,
+):
+    device_names = [str(device) for device in devices]
+    return {
+        "schema_version": JSON_REPORT_SCHEMA_VERSION,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "status": health.status,
+        "config": config,
+        "environment": environment,
+        "devices": [
+            {"name": device, "status": health.device_status(device)}
+            for device in device_names
+        ],
+        "issues": [
+            {
+                "severity": issue.severity,
+                "device": issue.device,
+                "message": issue.message,
+            }
+            for issue in health.issues
+        ],
+        "benchmark_summaries": {
+            device: benchmark_summary_to_dict(summary)
+            for device, summary in health.benchmark_summaries.items()
+        },
+        "operation_summaries": {
+            device: [
+                operation_summary_to_dict(summary)
+                for summary in summaries
+            ]
+            for device, summaries in health.operation_summaries.items()
+        },
+        "memory_summaries": {
+            device: [
+                memory_summary_to_dict(summary)
+                for summary in summaries
+            ]
+            for device, summaries in health.memory_summaries.items()
+        },
+        "telemetry": {
+            device: {
+                "summary": health.telemetry_summary(device),
+                "samples": [
+                    telemetry_sample_to_dict(sample)
+                    for sample in health.telemetry_samples.get(device, [])
+                ],
+            }
+            for device in device_names
+        },
+    }
+
+
+def write_json_report(path, report, logger):
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as report_file:
+        json.dump(report, report_file, indent=2, sort_keys=True)
+        report_file.write("\n")
+    logger.info(f"Wrote JSON report: {path}")
+
+
+def log_health_summary(logger, health, devices):
+    logger.info(f"Health summary: {health.status}")
+    for device in devices:
+        logger.info(f"[{device}] health={health.device_status(device)}")
+        telemetry_summary = health.telemetry_summary(device)
+        if telemetry_summary["sample_count"]:
+            logger.info(
+                f"[{device}] telemetry: samples={telemetry_summary['sample_count']}, "
+                f"max_temp={telemetry_summary['max_temperature_c']}, "
+                f"max_power={telemetry_summary['max_power_w']}, "
+                f"max_memory={telemetry_summary['max_memory_used_mb']}, "
+                f"max_gpu_util={telemetry_summary['max_gpu_utilization_percent']}, "
+                f"max_mem_util={telemetry_summary['max_memory_utilization_percent']}, "
+                f"max_sm_clock={telemetry_summary['max_sm_clock_mhz']}, "
+                f"max_mem_clock={telemetry_summary['max_memory_clock_mhz']}, "
+                f"throttle_reasons={telemetry_summary['throttle_reasons']}"
+            )
+    for issue in health.warnings:
+        prefix = "" if issue.device is None else f"[{issue.device}] "
+        logger.warning(f"{prefix}WARN: {issue.message}")
+    for issue in health.failures:
+        prefix = "" if issue.device is None else f"[{issue.device}] "
+        safe_logger_error(logger, f"{prefix}FAIL: {issue.message}")
+
+
+def finish_run(
+    health,
+    config,
+    devices,
+    environment,
+    started_at,
+    json_report,
+    logger,
+):
+    finished_at = utc_now_iso()
+    log_health_summary(logger, health, devices)
+    if json_report:
+        report = build_json_report(
+            health,
+            config,
+            devices,
+            environment,
+            started_at,
+            finished_at,
+        )
+        write_json_report(json_report, report, logger)
+    if health.failures:
+        raise click.ClickException("Health check failed.")
+
+
+def build_compute_operations_for_suite(suite, size, device, dt, logger, health=None):
+    ops = []
+    if suite in ("basic", "all", "full"):
+        ops.extend(build_basic_ops(size, device, dt))
+    if suite in ("extended", "all", "full"):
+        try:
+            ops.extend(build_extended_ops(size, device, dt))
+        except Exception as exc:
+            if health is not None:
+                health.fail(device, f"extended suite setup failed: {exc}")
+            logger.warning(f"[{device}] Skipping extended suite: {exc}")
+    return ops
+
+
+def run_stress_for_device(
+    device,
+    suite,
+    size,
+    dt,
+    iterations,
+    memory_percent,
+    memory_mb,
+    duration,
+    correctness,
+    correctness_interval,
+    logger,
+    health,
+    telemetry_monitor,
+):
+    logger.info(f"\nBenchmarking on device: {device}")
+    deadline = time.perf_counter() + duration if duration is not None else None
+    memory_context = None
+    memory_times = []
+    compute_enabled = suite in COMPUTE_SUITES
+    memory_enabled = suite in MEMORY_SUITES
+    memory_dt = get_memory_dtype(device, dt, logger) if memory_enabled else None
+    ops = []
+
+    try:
+        if compute_enabled:
+            skip_reason = get_skip_reason(device, dt)
+            if skip_reason:
+                logger.warning(skip_reason)
+            else:
+                try:
+                    ops = build_compute_operations_for_suite(
+                        suite,
+                        size,
+                        device,
+                        dt,
+                        logger,
+                        health=health,
+                    )
+                except Exception as exc:
+                    health.fail(device, f"compute setup failed: {exc}")
+                    logger.warning(f"[{device}] Compute setup failed: {exc}")
+
+        if deadline is not None and memory_enabled:
+            try:
+                memory_context = prepare_memory_stress(
+                    device,
+                    memory_dt,
+                    memory_percent,
+                    memory_mb,
+                    logger,
+                )
+            except (RuntimeError, MemoryError, TypeError) as exc:
+                result = make_memory_stress_result(
+                    device,
+                    0,
+                    [],
+                    safe_get_memory_stats(device, health),
+                    failed=True,
+                    error=str(exc),
+                )
+                log_memory_stress_result(logger, result)
+                health.add_memory_summary(result)
+
+        if compute_enabled and ops:
+            if deadline is None:
+                try:
+                    run_operations(
+                        ops,
+                        device,
+                        iterations,
+                        logger,
+                        skip_failed_ops=suite in ("extended", "all", "full"),
+                        correctness=correctness,
+                        correctness_interval=correctness_interval,
+                        telemetry_monitor=telemetry_monitor,
+                        health=health,
+                    )
+                except Exception as exc:
+                    health.fail(device, f"compute stress failed: {exc}")
+                    logger.warning(f"[{device}] Compute stress failed: {exc}")
+            else:
+                run_operations_for_duration(
+                    ops,
+                    device,
+                    deadline,
+                    logger,
+                    correctness=correctness,
+                    correctness_interval=correctness_interval,
+                    telemetry_monitor=telemetry_monitor,
+                    health=health,
+                    memory_context=memory_context,
+                    memory_dt=memory_dt,
+                    memory_times=memory_times,
+                )
+
+        if memory_enabled:
+            if deadline is None:
+                memory_kwargs = {}
+                if correctness != "off":
+                    memory_kwargs["correctness"] = correctness
+                    memory_kwargs["correctness_interval"] = correctness_interval
+                if telemetry_monitor is not None and telemetry_monitor.enabled:
+                    memory_kwargs["telemetry_monitor"] = telemetry_monitor
+                result = run_memory_stress(
+                    device,
+                    memory_dt,
+                    iterations,
+                    memory_percent,
+                    memory_mb,
+                    logger,
+                    **memory_kwargs,
+                )
+                if isinstance(result, MemoryStressResult):
+                    health.add_memory_summary(result)
+            elif memory_context is not None:
+                if not memory_context.failed and (not compute_enabled or not memory_times):
+                    try:
+                        memory_times.extend(
+                            run_memory_context_until_deadline(
+                                memory_context,
+                                deadline,
+                                memory_dt,
+                                correctness,
+                                correctness_interval,
+                                telemetry_monitor=telemetry_monitor,
+                            )
+                        )
+                    except (RuntimeError, MemoryError, TypeError) as exc:
+                        record_memory_context_failure(
+                            memory_context,
+                            memory_times,
+                            exc,
+                            logger,
+                            health,
+                        )
+                if not memory_context.failed:
+                    result = make_memory_stress_result(
+                        device,
+                        memory_context.allocated_bytes,
+                        memory_times,
+                        safe_get_memory_stats(device, health),
+                    )
+                    log_memory_stress_result(logger, result)
+                    health.add_memory_summary(result)
+    except (RuntimeError, MemoryError, TypeError) as exc:
+        health.fail(device, f"stress failed: {exc}")
+        logger.warning(f"[{device}] Stress failed: {exc}")
+    finally:
+        if memory_context is not None:
+            release_memory_chunks(memory_context.chunks, device)
 
 
 @click.command()
@@ -994,6 +2390,58 @@ def run_memory_stress(device, dt, iterations, memory_percent, memory_mb, logger)
     help="Minimum timing duration per benchmark subtest.",
 )
 @click.option(
+    "--preset",
+    default=None,
+    type=click.Choice(PRESET_CHOICES),
+    help="Apply a preset profile, for example gpu-health.",
+)
+@click.option(
+    "--telemetry/--no-telemetry",
+    default=False,
+    show_default=True,
+    help="Collect PyTorch and NVML telemetry where supported.",
+)
+@click.option(
+    "--telemetry-interval",
+    default=DEFAULT_TELEMETRY_INTERVAL,
+    show_default=True,
+    type=click.FloatRange(min=0.1),
+    help="Seconds between telemetry samples.",
+)
+@click.option(
+    "--max-temp-c",
+    default=DEFAULT_MAX_TEMP_C,
+    show_default=True,
+    type=click.FloatRange(min=1.0),
+    help="Fail health checks at or above this GPU temperature.",
+)
+@click.option(
+    "--correctness",
+    default="off",
+    show_default=True,
+    type=click.Choice(CORRECTNESS_CHOICES),
+    help="Correctness checking depth for stress operations.",
+)
+@click.option(
+    "--correctness-interval",
+    default=DEFAULT_CORRECTNESS_INTERVAL,
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Operation interval for sampled correctness checks.",
+)
+@click.option(
+    "--duration",
+    default=None,
+    type=click.FloatRange(min=0.001),
+    help="Run stress mode for this many seconds per device; overrides --iterations.",
+)
+@click.option(
+    "--json-report",
+    default=None,
+    type=click.Path(dir_okay=False, writable=True),
+    help="Write a machine-readable JSON report.",
+)
+@click.option(
     "--verbose", is_flag=True,
     help="Enable DEBUG logging.",
 )
@@ -1010,6 +2458,14 @@ def main(
     benchmark_memory: bool,
     benchmark_min_time: float,
     verbose: bool,
+    preset: str | None = None,
+    telemetry: bool = False,
+    telemetry_interval: float = DEFAULT_TELEMETRY_INTERVAL,
+    max_temp_c: float = DEFAULT_MAX_TEMP_C,
+    correctness: str = "off",
+    correctness_interval: int = DEFAULT_CORRECTNESS_INTERVAL,
+    duration: float | None = None,
+    json_report: str | None = None,
 ):
     """
     Benchmark common PyTorch operations across available devices.
@@ -1018,68 +2474,106 @@ def main(
     logger = setup_logger(level)
 
     validate_torch_installation()
+
+    mode, suite, device, memory_percent, duration, telemetry, correctness = (
+        apply_preset_defaults(
+            preset,
+            mode,
+            suite,
+            device,
+            memory_percent,
+            memory_mb,
+            duration,
+            telemetry,
+            correctness,
+        )
+    )
+    if mode == "benchmark" and duration is not None:
+        raise click.ClickException("--duration is only supported in stress mode.")
+
     log_environment_info(logger)
+    environment = build_environment_report()
 
     torch.manual_seed(seed)
     devices = filter_devices(get_devices(), device)
     logger.info(f"Detected devices: {devices}")
+    started_at = utc_now_iso()
+    health = HealthReport(max_temp_c=max_temp_c)
+    telemetry_monitor = TelemetryMonitor(
+        telemetry,
+        devices,
+        telemetry_interval,
+        logger,
+        health,
+    )
+    config = {
+        "preset": preset,
+        "mode": mode,
+        "suite": suite,
+        "iterations": iterations,
+        "duration_s": duration,
+        "size": size,
+        "dtype": dtype,
+        "memory_percent": memory_percent,
+        "memory_mb": memory_mb,
+        "seed": seed,
+        "device": device,
+        "benchmark_memory": benchmark_memory,
+        "benchmark_min_time": benchmark_min_time,
+        "telemetry": telemetry,
+        "telemetry_interval_s": telemetry_interval,
+        "max_temp_c": max_temp_c,
+        "correctness": correctness,
+        "correctness_interval": correctness_interval,
+    }
 
     # Map dtype strings to torch dtypes
     dtype_map = {"float": torch.float32, "double": torch.float64, "half": torch.float16}
     dt = dtype_map[dtype]
 
-    if mode == "benchmark":
-        run_benchmark_mode(
-            devices,
-            dt,
-            benchmark_memory,
-            memory_mb,
-            benchmark_min_time,
-            logger,
-        )
-        return
-
-    for bench_device in devices:
-        logger.info(f"\nBenchmarking on device: {bench_device}")
-
-        if suite in COMPUTE_SUITES:
-            skip_reason = get_skip_reason(bench_device, dt)
-            if skip_reason:
-                logger.warning(skip_reason)
-            else:
-                if suite in ("basic", "all", "full"):
-                    run_operations(
-                        build_basic_ops(size, bench_device, dt),
-                        bench_device,
-                        iterations,
-                        logger,
-                    )
-                if suite in ("extended", "all", "full"):
-                    try:
-                        extended_ops = build_extended_ops(size, bench_device, dt)
-                    except Exception as exc:
-                        logger.warning(
-                            f"[{bench_device}] Skipping extended suite: {exc}"
-                        )
-                    else:
-                        run_operations(
-                            extended_ops,
-                            bench_device,
-                            iterations,
-                            logger,
-                            skip_failed_ops=True,
-                        )
-
-        if suite in MEMORY_SUITES:
-            memory_dt = get_memory_dtype(bench_device, dt, logger)
-            run_memory_stress(
-                bench_device,
-                memory_dt,
-                iterations,
-                memory_percent,
+    try:
+        telemetry_monitor.sample_all(force=True)
+        if mode == "benchmark":
+            summaries = run_benchmark_mode(
+                devices,
+                dt,
+                benchmark_memory,
                 memory_mb,
+                benchmark_min_time,
                 logger,
             )
+            for bench_device, summary in summaries.items():
+                health.add_benchmark_summary(bench_device, summary)
+        else:
+            for bench_device in devices:
+                run_stress_for_device(
+                    bench_device,
+                    suite,
+                    size,
+                    dt,
+                    iterations,
+                    memory_percent,
+                    memory_mb,
+                    duration,
+                    correctness,
+                    correctness_interval,
+                    logger,
+                    health,
+                    telemetry_monitor,
+                )
+        telemetry_monitor.sample_all(force=True)
+    finally:
+        telemetry_monitor.close()
+
+    finish_run(
+        health,
+        config,
+        devices,
+        environment,
+        started_at,
+        json_report,
+        logger,
+    )
 
 
 if __name__ == "__main__":

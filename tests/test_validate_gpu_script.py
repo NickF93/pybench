@@ -98,8 +98,7 @@ class ValidateGpuScriptTests(unittest.TestCase):
         self.assertIn("estimated timed stress   35m 0s", result.stdout)
         self.assertIn("--duration 300", result.stdout)
         self.assertIn("--duration 1800", result.stdout)
-        self.assertIn("--correctness strict", result.stdout)
-        self.assertIn("--correctness sampled", result.stdout)
+        self.assertEqual(result.stdout.count("--correctness sampled"), 2)
         self.assertIn("--mode benchmark", result.stdout)
         self.assertIn("--benchmark-memory", result.stdout)
         self.assertIn("--progress-interval 60", result.stdout)
@@ -132,7 +131,7 @@ class ValidateGpuScriptTests(unittest.TestCase):
             calls = self.read_pybench_invocations(fake_log)
             self.assertEqual(len(calls), 3)
             self.assertIn("--preset", calls[0])
-            self.assertEqual(calls[0][calls[0].index("--correctness") + 1], "strict")
+            self.assertEqual(calls[0][calls[0].index("--correctness") + 1], "sampled")
             self.assertEqual(calls[0][calls[0].index("--duration") + 1], "300")
             self.assertIn("--progress", calls[0])
             self.assertEqual(calls[0][calls[0].index("--progress-interval") + 1], "60")
@@ -142,6 +141,32 @@ class ValidateGpuScriptTests(unittest.TestCase):
             self.assertIn("--mode", calls[2])
             self.assertIn("--benchmark-memory", calls[2])
             self.assertIn("--progress", calls[2])
+
+    def test_correctness_overrides_are_passed_to_smoke_and_soak(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_python, fake_log, env = self.make_fake_python(temp_dir)
+            result = self.run_script(
+                [
+                    "--device",
+                    "cuda:0",
+                    "--python",
+                    str(fake_python),
+                    "--out-dir",
+                    str(Path(temp_dir) / "reports"),
+                    "--smoke-correctness",
+                    "strict",
+                    "--soak-correctness",
+                    "off",
+                    "--skip-benchmark",
+                ],
+                env=env,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = self.read_pybench_invocations(fake_log)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[0][calls[0].index("--correctness") + 1], "strict")
+            self.assertEqual(calls[1][calls[1].index("--correctness") + 1], "off")
 
     def test_warn_status_fails_by_default(self):
         with tempfile.TemporaryDirectory() as temp_dir:

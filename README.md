@@ -81,11 +81,12 @@ Validate a specific CUDA GPU with the root helper script:
 ./validate_gpu.sh --device cuda:0
 ```
 
-The helper runs a 5-minute strict smoke test, a 30-minute sampled soak test, and
+The helper runs a 5-minute sampled smoke test, a 30-minute sampled soak test, and
 a benchmark baseline with memory subtests. Logs, JSON reports, and optional
 `nvidia-smi` snapshots are written under `reports/gpu-validation/`. It treats
 `WARN` as a failed validation unless `--allow-warn` is passed. Override the
-defaults when needed:
+defaults when needed. Use `--smoke-correctness strict` only when you explicitly
+want every operation and full-memory touch validated every iteration:
 
 ```bash
 ./validate_gpu.sh --device cuda:0 --soak-duration 900 --memory-percent 70

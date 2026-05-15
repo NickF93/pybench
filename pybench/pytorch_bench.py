@@ -64,6 +64,15 @@ HARD_THROTTLE_REASONS = frozenset(
     }
 )
 IGNORED_THROTTLE_REASONS = frozenset({"gpu_idle", "sw_power_cap"})
+UNRECOVERABLE_DEVICE_ERROR_MARKERS = (
+    "launch timed out",
+    "device-side assert",
+    "illegal memory access",
+    "unspecified launch failure",
+    "CUBLAS_STATUS_INTERNAL_ERROR",
+    "CUBLAS_STATUS_EXECUTION_FAILED",
+    "CUDNN_STATUS_EXECUTION_FAILED",
+)
 NVML_THROTTLE_REASON_MAP = (
     (
         "gpu_idle",
@@ -783,6 +792,11 @@ def scalar_to_float(value):
         return None
 
 
+def is_unrecoverable_device_error(error):
+    message = str(error)
+    return any(marker in message for marker in UNRECOVERABLE_DEVICE_ERROR_MARKERS)
+
+
 def tensor_sum_for_validation(tensor, dt):
     sum_fn = getattr(tensor, "sum", None)
     if not callable(sum_fn):
@@ -811,6 +825,14 @@ def validate_memory_sum(name, tensor, fill_value, dt, device, observed_sum=None)
             f"{name} memory validation failed on {device}: "
             f"expected {expected:.6g}, got {actual:.6g}"
         )
+
+
+def touch_memory_chunk_without_validation(chunk):
+    add_in_place = getattr(chunk, "add_", None)
+    if callable(add_in_place):
+        add_in_place(0)
+        return
+    chunk.sum()
 
 
 def measure_benchmark_test(benchmark_test, device, min_run_time):
@@ -1120,7 +1142,7 @@ def run_benchmark_mode(
                 logger.warning(f"[{device}] Skipping benchmark memory: {exc}")
             finally:
                 if memory_chunks:
-                    release_memory_chunks(memory_chunks, device)
+                    safe_release_memory_chunks(memory_chunks, device, logger)
 
         summary = summarize_benchmark_scores(compute_results, memory_results)
         summaries[device] = summary
@@ -1446,6 +1468,7 @@ def run_operations_for_duration(
     progress_reporter.start(f"[{device}] duration stress", duration)
 
     with inference_context():
+        abort_duration = False
         while time.perf_counter() < deadline:
             cycle_completed = False
             for name, fn in ops:
@@ -1467,6 +1490,9 @@ def run_operations_for_duration(
                     if health is not None:
                         health.fail(device, f"operation {name} failed: {exc}")
                     logger.warning(f"[{device}] Skipping {name}: {exc}")
+                    if is_unrecoverable_device_error(exc):
+                        abort_duration = True
+                        break
                     continue
                 times_by_name[name].append(elapsed)
                 iteration_by_name[name] += 1
@@ -1474,6 +1500,8 @@ def run_operations_for_duration(
                 if telemetry_monitor is not None:
                     telemetry_monitor.sample(device)
                 progress_reporter.maybe_log()
+            if abort_duration:
+                break
             if (
                 memory_context is not None
                 and memory_times is not None
@@ -1500,10 +1528,14 @@ def run_operations_for_duration(
                         logger,
                         health,
                     )
+                    abort_duration = True
+                    break
                 else:
                     if telemetry_monitor is not None:
                         telemetry_monitor.sample(device)
                     progress_reporter.maybe_log()
+            if abort_duration:
+                break
             if failed_ops and len(failed_ops) == len(ops):
                 break
     progress_reporter.finish()
@@ -1973,7 +2005,7 @@ def touch_memory_chunks_once(
                 observed_sum=observed_sum,
             )
         else:
-            chunk.sum()
+            touch_memory_chunk_without_validation(chunk)
     sync(device)
     return time.perf_counter() - start
 
@@ -2018,6 +2050,18 @@ def touch_memory_chunks(
 def release_memory_chunks(chunks, device):
     chunks.clear()
     clear_device_cache(device)
+
+
+def safe_release_memory_chunks(chunks, device, logger=None, health=None):
+    try:
+        release_memory_chunks(chunks, device)
+    except Exception as exc:
+        if logger is not None:
+            logger.warning(f"[{device}] Memory cleanup failed: {exc}")
+        if health is not None:
+            health.warn(device, f"memory cleanup failed: {exc}")
+        return False
+    return True
 
 
 def format_memory_stats(stats):
@@ -2149,7 +2193,7 @@ def run_memory_stress(
         return result
     finally:
         if context is not None:
-            release_memory_chunks(context.chunks, device)
+            safe_release_memory_chunks(context.chunks, device, logger)
 
 
 def run_memory_context_until_deadline(
@@ -2570,7 +2614,7 @@ def run_stress_for_device(
         logger.warning(f"[{device}] Stress failed: {exc}")
     finally:
         if memory_context is not None:
-            release_memory_chunks(memory_context.chunks, device)
+            safe_release_memory_chunks(memory_context.chunks, device, logger, health)
 
 
 @click.command()

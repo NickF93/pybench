@@ -17,6 +17,7 @@ class FakeTensor:
         self.fill_values = []
         self.scalar = scalar
         self.sum_calls = 0
+        self.add_values = []
 
     def __matmul__(self, other):
         return FakeTensor("matmul")
@@ -38,6 +39,10 @@ class FakeTensor:
 
     def fill_(self, value):
         self.fill_values.append(value)
+        return self
+
+    def add_(self, value):
+        self.add_values.append(value)
         return self
 
     def numel(self):
@@ -733,6 +738,23 @@ class PyTorchBenchTests(unittest.TestCase):
         validate_memory_sum.assert_called_once()
         self.assertIn("observed_sum", validate_memory_sum.call_args.kwargs)
 
+    def test_memory_touch_without_validation_avoids_reduction(self):
+        module, fake_torch = load_bench_module()
+        device = fake_torch.device("cpu")
+        chunk = FakeTensor(elements=4)
+
+        module.touch_memory_chunks_once(
+            [chunk],
+            device,
+            fake_torch.float32,
+            iteration_index=1,
+            correctness="sampled",
+            correctness_interval=10,
+        )
+
+        self.assertEqual(chunk.sum_calls, 0)
+        self.assertEqual(chunk.add_values, [0])
+
     def test_memory_correctness_policy_covers_smoke_sampled_and_strict(self):
         module, _ = load_bench_module()
 
@@ -832,6 +854,7 @@ class PyTorchBenchTests(unittest.TestCase):
             )
 
         self.assertTrue(memory_context.failed)
+        self.assertEqual(len(memory_times), 0)
         self.assertEqual(touch_memory.call_count, 1)
         summaries = health.memory_summaries[str(device)]
         self.assertEqual(len(summaries), 1)
@@ -893,6 +916,55 @@ class PyTorchBenchTests(unittest.TestCase):
             )
 
         self.assertEqual(order, ["basic", "extended", "memory"])
+
+    def test_stress_cleanup_failure_warns_without_raising(self):
+        module, fake_torch = load_bench_module()
+        logger = types.SimpleNamespace(info=mock.Mock(), warning=mock.Mock())
+        device = fake_torch.device("cpu")
+        health = module.HealthReport(max_temp_c=90.0)
+        memory_context = module.MemoryStressContext(
+            device=device,
+            chunks=[FakeTensor()],
+            allocated_bytes=4,
+            available_bytes=8,
+            total_bytes=16,
+            source="test",
+        )
+
+        with (
+            mock.patch.object(module, "build_basic_ops", return_value=[]),
+            mock.patch.object(module, "prepare_memory_stress", return_value=memory_context),
+            mock.patch.object(
+                module,
+                "run_memory_context_until_deadline",
+                return_value=[0.1],
+            ),
+            mock.patch.object(
+                module,
+                "release_memory_chunks",
+                side_effect=RuntimeError("cleanup timeout"),
+            ),
+        ):
+            module.run_stress_for_device(
+                device,
+                suite="full",
+                size=1,
+                dt=fake_torch.float32,
+                iterations=1,
+                memory_percent=70.0,
+                memory_mb=None,
+                duration=1.0,
+                correctness="off",
+                correctness_interval=10,
+                logger=logger,
+                health=health,
+                telemetry_monitor=None,
+            )
+
+        self.assertEqual(health.status, module.HEALTH_WARN)
+        self.assertTrue(
+            any("memory cleanup failed: cleanup timeout" == issue.message for issue in health.warnings)
+        )
 
     def test_telemetry_torch_memory_failures_warn_without_aborting_sample(self):
         module, fake_torch = load_bench_module()

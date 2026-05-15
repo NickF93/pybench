@@ -14,6 +14,8 @@ TELEMETRY_INTERVAL="5"
 PROGRESS_INTERVAL="60"
 SIZE="2048"
 DTYPE="float"
+SMOKE_CORRECTNESS="sampled"
+SOAK_CORRECTNESS="sampled"
 OUT_DIR="${SCRIPT_DIR}/reports/gpu-validation"
 PYTHON_BIN="${PYTHON:-python3}"
 SKIP_BENCHMARK=0
@@ -32,14 +34,16 @@ Required:
   --device DEVICE              CUDA device filter to validate, for example cuda:0.
 
 Options:
-  --smoke-duration SECONDS     First strict validation stage duration. Default: 300.
-  --soak-duration SECONDS      Longer sampled validation stage duration. Default: 1800.
+  --smoke-duration SECONDS     First validation stage duration. Default: 300.
+  --soak-duration SECONDS      Longer validation stage duration. Default: 1800.
   --memory-percent PERCENT     Percent of available VRAM to stress. Default: 80.
   --max-temp-c C               Fail at or above this GPU temperature. Default: 90.
   --telemetry-interval SECONDS Seconds between telemetry samples. Default: 5.
   --progress-interval SECONDS  Seconds between progress logs. Default: 60.
   --size N                     Matrix size for stress operations. Default: 2048.
   --dtype TYPE                 float, double, or half. Default: float.
+  --smoke-correctness MODE     off, smoke, sampled, or strict. Default: sampled.
+  --soak-correctness MODE      off, smoke, sampled, or strict. Default: sampled.
   --out-dir PATH               Base directory for timestamped artifacts.
   --python PATH                Python executable to run pybench. Default: ${PYTHON:-python3}.
   --skip-benchmark             Skip the final benchmark baseline.
@@ -111,6 +115,16 @@ while (($#)); do
             DTYPE="$2"
             shift 2
             ;;
+        --smoke-correctness)
+            require_value "$1" "${2:-}"
+            SMOKE_CORRECTNESS="$2"
+            shift 2
+            ;;
+        --soak-correctness)
+            require_value "$1" "${2:-}"
+            SOAK_CORRECTNESS="$2"
+            shift 2
+            ;;
         --out-dir)
             require_value "$1" "${2:-}"
             OUT_DIR="$2"
@@ -159,6 +173,14 @@ fi
 case "$DTYPE" in
     float|double|half) ;;
     *) fail "--dtype must be float, double, or half" ;;
+esac
+case "$SMOKE_CORRECTNESS" in
+    off|smoke|sampled|strict) ;;
+    *) fail "--smoke-correctness must be off, smoke, sampled, or strict" ;;
+esac
+case "$SOAK_CORRECTNESS" in
+    off|smoke|sampled|strict) ;;
+    *) fail "--soak-correctness must be off, smoke, sampled, or strict" ;;
 esac
 for numeric_option in SMOKE_DURATION SOAK_DURATION PROGRESS_INTERVAL; do
     numeric_value="${!numeric_option}"
@@ -373,7 +395,7 @@ SMOKE_CMD=(
     --telemetry-interval "$TELEMETRY_INTERVAL"
     --progress-interval "$PROGRESS_INTERVAL"
     --max-temp-c "$MAX_TEMP_C"
-    --correctness strict
+    --correctness "$SMOKE_CORRECTNESS"
     --size "$SIZE"
     --dtype "$DTYPE"
     --json-report "$SMOKE_JSON"
@@ -401,7 +423,7 @@ if ((overall_status == 0)); then
         --telemetry-interval "$TELEMETRY_INTERVAL"
         --progress-interval "$PROGRESS_INTERVAL"
         --max-temp-c "$MAX_TEMP_C"
-        --correctness sampled
+        --correctness "$SOAK_CORRECTNESS"
         --size "$SIZE"
         --dtype "$DTYPE"
         --json-report "$SOAK_JSON"
